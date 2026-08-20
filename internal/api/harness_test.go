@@ -19,7 +19,9 @@ import (
 	"github.com/rake-pro/go-bookshelf/internal/images"
 	"github.com/rake-pro/go-bookshelf/internal/library"
 	"github.com/rake-pro/go-bookshelf/internal/server"
+	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
+	"github.com/rake-pro/go-bookshelf/internal/storetest"
 	"github.com/rs/zerolog"
 )
 
@@ -32,21 +34,26 @@ func TestMain(m *testing.M) {
 }
 
 type harness struct {
-	t       *testing.T
-	ctx     context.Context
-	cfg     config.Config
-	db      *store.DB
-	cat     *library.Catalog
-	auth    *auth.Manager
-	scanner *library.Scanner
-	handler http.Handler
-	media   string
-	otherMe string
+	t        *testing.T
+	ctx      context.Context
+	cfg      config.Config
+	settings *settings.Service
+	db       *store.DB
+	cat      *library.Catalog
+	auth     *auth.Manager
+	scanner  *library.Scanner
+	handler  http.Handler
+	media    string
+	otherMe  string
 }
 
 type harnessOptions struct {
 	proxyAuthHeader string
 	trustedProxies  []string
+	adminRecovery   bool
+	// noDataDir runs the server with no local data directory, so every read
+	// that used to touch a file has to come out of the database.
+	noDataDir bool
 }
 
 func newHarness(t *testing.T, opts ...harnessOptions) *harness {
@@ -54,19 +61,30 @@ func newHarness(t *testing.T, opts ...harnessOptions) *harness {
 	ctx := context.Background()
 	dir := t.TempDir()
 
+	// The whole API contract runs against whichever backend storetest hands
+	// back: SQLite by default, Postgres when GOBOOKSHELF_TEST_POSTGRES_DSN is
+	// set. Nothing below this line knows which one it got.
+	driver, target := storetest.Target(t)
 	cfg := config.Default()
-	cfg.DBPath = filepath.Join(dir, "test.db")
-	cfg.DataDir = dir
-	cfg.BaseURL = "http://localhost:8080"
-	cfg.SecureCookies = false
-	if len(opts) > 0 {
-		cfg.ProxyAuthHeader = opts[0].proxyAuthHeader
-		cfg.TrustedProxies = opts[0].trustedProxies
+	cfg.DBDriver = driver
+	cfg.DBPath, cfg.DBDSN = "", ""
+	if driver == store.DriverPostgres {
+		cfg.DBDSN = target
+	} else {
+		cfg.DBPath = target
 	}
-	// Re-run the CIDR parsing that Load would normally do.
-	cfg = mustReload(t, cfg)
+	cfg.DataDir = dir
+	cfg.SecretsKey = config.DevInsecureKey()
+	if len(opts) > 0 {
+		cfg.AdminRecovery = opts[0].adminRecovery
+		if opts[0].noDataDir {
+			// No local disk at all: covers must still be served, from the
+			// database, which is the shape a multi-node deployment runs in.
+			cfg.DataDir = ""
+		}
+	}
 
-	db, err := store.Open(ctx, cfg.DBPath)
+	db, err := store.Open(ctx, cfg.DBDriver, cfg.DSN())
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -78,9 +96,24 @@ func newHarness(t *testing.T, opts ...harnessOptions) *harness {
 	}
 	cat := library.NewCatalog(db)
 	scanner := library.NewScanner(cat, covers)
-	authMgr, err := auth.New(ctx, db, cfg)
+	authMgr := auth.New(db, cfg)
+
+	set, err := settings.New(ctx, db, cfg.SecretsKey, false)
 	if err != nil {
-		t.Fatalf("auth: %v", err)
+		t.Fatalf("settings: %v", err)
+	}
+	set.Register(authMgr)
+	if len(opts) > 0 && opts[0].proxyAuthHeader != "" {
+		next := set.Get()
+		next.ProxyAuth = settings.ProxyAuth{
+			Enabled: true, Header: opts[0].proxyAuthHeader, TrustedProxies: opts[0].trustedProxies,
+		}
+		if err := set.Save(ctx, next); err != nil {
+			t.Fatalf("proxy settings: %v", err)
+		}
+	}
+	if err := set.Apply(ctx); err != nil {
+		t.Fatalf("apply settings: %v", err)
 	}
 
 	media := filepath.Join(dir, "media")
@@ -92,43 +125,24 @@ func newHarness(t *testing.T, opts ...harnessOptions) *harness {
 		t.Fatal(err)
 	}
 
-	a := api.New(cfg, db, cat, authMgr, scanner, covers, "test")
-	handler := server.New(cfg, a, authMgr, os.DirFS(mustFrontendStub(t, dir)))
+	a := api.New(cfg, set, db, cat, authMgr, scanner, covers, "test")
+	handler := server.New(a, authMgr, set, os.DirFS(mustFrontendStub(t, dir)))
 
 	return &harness{
-		t: t, ctx: ctx, cfg: cfg, db: db, cat: cat, auth: authMgr,
+		t: t, ctx: ctx, cfg: cfg, settings: set, db: db, cat: cat, auth: authMgr,
 		scanner: scanner, handler: handler, media: media, otherMe: other,
 	}
 }
 
-// mustReload runs the config through Load so the parsed CIDR sets are built,
-// using environment variables rather than reaching into unexported fields.
-func mustReload(t *testing.T, cfg config.Config) config.Config {
-	t.Helper()
-	t.Setenv("GOBOOKSHELF_DB_PATH", cfg.DBPath)
-	t.Setenv("GOBOOKSHELF_DATA_DIR", cfg.DataDir)
-	t.Setenv("GOBOOKSHELF_BASE_URL", cfg.BaseURL)
-	t.Setenv("GOBOOKSHELF_SECURE_COOKIES", "false")
-	// Always set these, including to the empty string: a sub-test building a
-	// second harness must not inherit the parent's proxy configuration.
-	t.Setenv("GOBOOKSHELF_PROXY_AUTH_HEADER", cfg.ProxyAuthHeader)
-	t.Setenv("GOBOOKSHELF_TRUSTED_PROXIES", joinCommas(cfg.TrustedProxies))
-	loaded, err := config.Load("")
-	if err != nil {
-		t.Fatalf("config: %v", err)
+// mutateSettings edits the stored settings the way the admin page would, and
+// fails the test if the edit is rejected.
+func (h *harness) mutateSettings(mut func(*settings.Settings)) {
+	h.t.Helper()
+	next := h.settings.Get()
+	mut(&next)
+	if err := h.settings.Save(h.ctx, next); err != nil {
+		h.t.Fatalf("save settings: %v", err)
 	}
-	return loaded
-}
-
-func joinCommas(v []string) string {
-	out := ""
-	for i, s := range v {
-		if i > 0 {
-			out += ","
-		}
-		out += s
-	}
-	return out
 }
 
 // mustFrontendStub creates a minimal static tree so the SPA fallback has
@@ -205,20 +219,44 @@ func withRemoteAddr(addr string) func(*http.Request) {
 	return func(r *http.Request) { r.RemoteAddr = addr }
 }
 
-// setupAdmin completes first-run setup and returns the admin's session id.
+// setupAdmin walks the whole first-run wizard - token, administrator, base URL,
+// no identity provider, no library - and returns the admin's session id. Every
+// test that touches the API goes through it, so the wizard is exercised by the
+// entire suite rather than by one test of its own.
 func (h *harness) setupAdmin() string {
 	h.t.Helper()
 	token, err := h.auth.EnsureSetupToken(h.ctx)
 	if err != nil {
 		h.t.Fatalf("setup token: %v", err)
 	}
-	rec := h.do(http.MethodPost, "/api/v1/auth/setup", map[string]string{
+
+	check := h.do(http.MethodPost, "/api/v1/setup/token", map[string]string{"token": token})
+	if check.Code != http.StatusOK {
+		h.t.Fatalf("setup/token returned %d: %s", check.Code, check.Body.String())
+	}
+
+	rec := h.do(http.MethodPost, "/api/v1/setup/admin", map[string]string{
 		"token": token, "username": "admin", "password": "correct-horse-battery", "display_name": "Admin",
 	})
 	if rec.Code != http.StatusOK {
-		h.t.Fatalf("setup returned %d: %s", rec.Code, rec.Body.String())
+		h.t.Fatalf("setup/admin returned %d: %s", rec.Code, rec.Body.String())
 	}
-	return sessionFrom(h.t, rec)
+	sid := sessionFrom(h.t, rec)
+
+	h.mustSetupStep(sid, "base-url", map[string]any{"base_url": "http://localhost:8080"})
+	h.mustSetupStep(sid, "oidc", map[string]any{"skip": true})
+	h.mustSetupStep(sid, "library", map[string]any{"skip": true})
+	h.mustSetupStep(sid, "complete", map[string]any{})
+	return sid
+}
+
+// mustSetupStep posts one wizard step and fails on anything but success.
+func (h *harness) mustSetupStep(sid, step string, body any) {
+	h.t.Helper()
+	rec := h.do(http.MethodPost, "/api/v1/setup/"+step, body, withCookie(sid))
+	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
+		h.t.Fatalf("setup/%s returned %d: %s", step, rec.Code, rec.Body.String())
+	}
 }
 
 // createUser adds a non-admin account and signs it in.

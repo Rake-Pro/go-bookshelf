@@ -19,26 +19,34 @@ import (
 	"github.com/rake-pro/go-bookshelf/internal/config"
 	"github.com/rake-pro/go-bookshelf/internal/images"
 	"github.com/rake-pro/go-bookshelf/internal/library"
+	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
 	"github.com/rs/zerolog/log"
 )
 
 // API holds everything the handlers need.
 type API struct {
-	cfg     config.Config
-	db      *store.DB
-	cat     *library.Catalog
-	auth    *auth.Manager
-	scanner *library.Scanner
-	covers  *images.Store
-	version string
+	cfg      config.Config
+	settings *settings.Service
+	db       *store.DB
+	cat      *library.Catalog
+	auth     *auth.Manager
+	scanner  *library.Scanner
+	covers   *images.Store
+	version  string
 }
 
 // New builds the API handler set.
-func New(cfg config.Config, db *store.DB, cat *library.Catalog, authMgr *auth.Manager,
-	scanner *library.Scanner, covers *images.Store, version string) *API {
-	return &API{cfg: cfg, db: db, cat: cat, auth: authMgr, scanner: scanner, covers: covers, version: version}
+func New(cfg config.Config, set *settings.Service, db *store.DB, cat *library.Catalog,
+	authMgr *auth.Manager, scanner *library.Scanner, covers *images.Store, version string) *API {
+	return &API{
+		cfg: cfg, settings: set, db: db, cat: cat, auth: authMgr,
+		scanner: scanner, covers: covers, version: version,
+	}
 }
+
+// baseURL is the external URL of this deployment, as configured in the app.
+func (a *API) baseURL() string { return a.settings.Get().General.BaseURL }
 
 // maxJSONBody bounds a request body the API will parse.
 const maxJSONBody = 1 << 20
@@ -66,6 +74,7 @@ const (
 	codeConflict     = "conflict"
 	codeRateLimited  = "rate_limited"
 	codeInternal     = "internal"
+	codeSetupPending = "setup_required"
 )
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -208,7 +217,6 @@ func (a *API) Register(mux *http.ServeMux) {
 
 	// Public: these are the only /api/v1 routes the auth middleware exempts.
 	mux.HandleFunc("GET "+p+"/auth/status", a.authStatus)
-	mux.HandleFunc("POST "+p+"/auth/setup", a.authSetup)
 	mux.HandleFunc("POST "+p+"/auth/login", a.authLogin)
 	mux.HandleFunc("POST "+p+"/auth/logout", a.authLogout)
 	mux.HandleFunc("GET "+p+"/auth/oidc/start", a.oidcStart)
@@ -259,7 +267,14 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+p+"/collections", a.listCollections)
 	mux.HandleFunc("POST "+p+"/collections", a.createCollection)
 
+	// First-run wizard. Every step is its own route so the client can resume
+	// at the step it got to; see docs/DESIGN.md.
+	mux.HandleFunc("POST "+p+"/setup/{step}", a.setupStep)
+
 	// Admin.
+	mux.HandleFunc("GET "+p+"/admin/settings", a.getAdminSettings)
+	mux.HandleFunc("PUT "+p+"/admin/settings", a.putAdminSettings)
+	mux.HandleFunc("POST "+p+"/admin/settings/oidc/test", a.testAdminOIDC)
 	mux.HandleFunc("GET "+p+"/users", a.listUsers)
 	mux.HandleFunc("POST "+p+"/users", a.createUser)
 	mux.HandleFunc("PATCH "+p+"/users/{id}", a.patchUser)
@@ -280,5 +295,5 @@ func (a *API) RegisterRoot(mux *http.ServeMux) {
 
 // configIPAllowed reports whether an address may read /metrics.
 func configIPAllowed(a *API, ip net.IP) bool {
-	return config.IPInNets(ip, a.cfg.MetricsAllowNets())
+	return settings.IPInNets(ip, a.settings.MetricsAllowNets())
 }

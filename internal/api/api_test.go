@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -28,12 +29,20 @@ func TestSetupLoginAndMe(t *testing.T) {
 
 	sid := h.setupAdmin()
 
-	// Setup is single-use.
-	again := h.do(http.MethodPost, "/api/v1/auth/setup", map[string]string{
-		"token": "whatever", "username": "second", "password": "another-long-password",
-	})
-	if again.Code != http.StatusConflict {
-		t.Errorf("second setup = %d, want 409", again.Code)
+	// The wizard is single-use: once finished, every step answers 409.
+	for _, step := range []string{"token", "admin", "base-url", "oidc", "library", "complete"} {
+		again := h.do(http.MethodPost, "/api/v1/setup/"+step, map[string]string{
+			"token": "whatever", "username": "second", "password": "another-long-password",
+		}, withCookie(sid))
+		if again.Code != http.StatusConflict {
+			t.Errorf("setup/%s after setup = %d, want 409", step, again.Code)
+		}
+	}
+
+	// And the status endpoint says so in both directions.
+	decode(t, h.do(http.MethodGet, "/api/v1/auth/status", nil), &st)
+	if st.SetupRequired {
+		t.Error("auth status still reports setup_required after the wizard finished")
 	}
 
 	me := h.do(http.MethodGet, "/api/v1/auth/me", nil, withCookie(sid))
@@ -67,7 +76,7 @@ func TestWeakPasswordRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := h.do(http.MethodPost, "/api/v1/auth/setup", map[string]string{
+	rec := h.do(http.MethodPost, "/api/v1/setup/admin", map[string]string{
 		"token": token, "username": "admin", "password": "short",
 	})
 	if rec.Code != http.StatusBadRequest {
@@ -313,27 +322,71 @@ func TestAudioStreamSupportsRange(t *testing.T) {
 	}
 }
 
-func TestCoverServedFromCache(t *testing.T) {
-	h := newHarness(t)
-	sid := h.setupAdmin()
-	h.seedLibrary(sid, "Everything", h.media)
-	itemID := h.firstItemID(sid, "ebook")
+func TestCoverServed(t *testing.T) {
+	// Once with a data directory, so the write-through cache is exercised, and
+	// once without one, so the same responses have to come out of the database
+	// alone. The second case is the deployment with no local volume.
+	for _, tc := range []struct {
+		name      string
+		noDataDir bool
+	}{
+		{"with a cover cache", false},
+		{"with no data directory", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, harnessOptions{noDataDir: tc.noDataDir})
+			sid := h.setupAdmin()
+			h.seedLibrary(sid, "Everything", h.media)
+			itemID := h.firstItemID(sid, "ebook")
 
-	for _, size := range []string{"", "thumb", "full"} {
-		path := "/api/v1/items/" + itoa(itemID) + "/cover"
-		if size != "" {
-			path += "?size=" + size
-		}
-		rec := h.do(http.MethodGet, path, nil, withCookie(sid))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("cover %q = %d", size, rec.Code)
-		}
-		if ct := rec.Header().Get("Content-Type"); ct != "image/jpeg" {
-			t.Errorf("cover content type = %q", ct)
-		}
-		if rec.Body.Len() == 0 {
-			t.Errorf("cover %q is empty", size)
-		}
+			var etags []string
+			for _, size := range []string{"", "thumb", "full"} {
+				path := "/api/v1/items/" + itoa(itemID) + "/cover"
+				if size != "" {
+					path += "?size=" + size
+				}
+				// Twice: the first request may populate the cache, the second
+				// must return exactly the same bytes from it.
+				var first []byte
+				for attempt := 0; attempt < 2; attempt++ {
+					rec := h.do(http.MethodGet, path, nil, withCookie(sid))
+					if rec.Code != http.StatusOK {
+						t.Fatalf("cover %q attempt %d = %d", size, attempt, rec.Code)
+					}
+					if ct := rec.Header().Get("Content-Type"); ct != "image/jpeg" {
+						t.Errorf("cover content type = %q", ct)
+					}
+					if rec.Header().Get("Cache-Control") == "" || rec.Header().Get("ETag") == "" {
+						t.Errorf("cover %q is missing its caching headers", size)
+					}
+					if rec.Body.Len() == 0 {
+						t.Fatalf("cover %q is empty", size)
+					}
+					if attempt == 0 {
+						first = append([]byte{}, rec.Body.Bytes()...)
+						etags = append(etags, rec.Header().Get("ETag"))
+						continue
+					}
+					if !bytes.Equal(first, rec.Body.Bytes()) {
+						t.Errorf("cover %q differed between the two reads", size)
+					}
+				}
+			}
+			// The default is the full variant, and the thumbnail is a
+			// different image.
+			if etags[0] != etags[2] {
+				t.Errorf("no size parameter returned a different image from ?size=full: %q vs %q", etags[0], etags[2])
+			}
+			if etags[1] == etags[2] {
+				t.Error("the thumbnail and the full-size cover are the same image")
+			}
+
+			// An item nobody gave artwork to is a 404, not an empty 200.
+			missing := h.do(http.MethodGet, "/api/v1/items/"+itoa(itemID+1000)+"/cover", nil, withCookie(sid))
+			if missing.Code != http.StatusNotFound {
+				t.Errorf("cover for an unknown item = %d, want 404", missing.Code)
+			}
+		})
 	}
 }
 

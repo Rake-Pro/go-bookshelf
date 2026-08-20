@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -20,9 +21,11 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rake-pro/go-bookshelf/internal/config"
+	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
 	"github.com/rs/zerolog/log"
 )
@@ -55,6 +58,7 @@ var (
 	ErrSetupDone       = errors.New("auth: setup has already been completed")
 	ErrSetupToken      = errors.New("auth: invalid setup token")
 	ErrRateLimited     = errors.New("auth: too many attempts")
+	ErrLocalLoginOff   = errors.New("auth: password sign-in is disabled")
 	ErrWeakPassword    = fmt.Errorf("auth: password must be at least %d characters", MinPasswordLength)
 )
 
@@ -100,6 +104,22 @@ func (i *Identity) HasScope(scope string) bool {
 	return false
 }
 
+// live is everything the manager reads out of the stored settings. It is
+// replaced wholesale on a settings save, so a request either sees the old
+// configuration or the new one and never a half-applied mixture.
+type live struct {
+	sessionTTL    time.Duration
+	secureCookies bool
+
+	proxyHeader string
+	trustedNets []*net.IPNet
+
+	localLogin   bool
+	autoRegister bool
+
+	oidc *oidcClient
+}
+
 // Manager is the auth service.
 type Manager struct {
 	db  *store.DB
@@ -108,37 +128,94 @@ type Manager struct {
 	loginLimiter *Limiter
 	setupLimiter *Limiter
 
-	oidc *oidcClient
+	mu  sync.RWMutex
+	cur live
 }
 
-// New builds a Manager and, when configured, performs OIDC discovery.
-func New(ctx context.Context, db *store.DB, cfg config.Config) (*Manager, error) {
-	m := &Manager{
+// New builds a Manager. It performs no network calls: the identity provider is
+// configured by Prepare, from the stored settings, and can be reconfigured at
+// runtime without a restart.
+func New(db *store.DB, cfg config.Config) *Manager {
+	return &Manager{
 		db:  db,
 		cfg: cfg,
 		// Ten attempts of burst, then one attempt per six seconds.
 		loginLimiter: NewLimiter(10, 6*time.Second),
 		setupLimiter: NewLimiter(5, 30*time.Second),
+		cur: live{
+			sessionTTL:   settings.Default().General.SessionTTL.D(),
+			localLogin:   true,
+			autoRegister: true,
+		},
 	}
-	if cfg.OIDC.Enabled() {
-		client, err := newOIDCClient(ctx, cfg)
-		if err != nil {
-			// A temporarily unreachable provider must not stop the server from
-			// serving local logins; OIDC stays off until the next restart.
-			log.Error().Err(err).Str("issuer", cfg.OIDC.Issuer).Msg("OIDC discovery failed; OIDC login is disabled")
-		} else {
-			m.oidc = client
-			log.Info().Str("issuer", cfg.OIDC.Issuer).Msg("OIDC login enabled")
-		}
-	}
-	return m, nil
 }
 
-// Config returns the configuration the manager was built with.
+// Prepare implements settings.Applier. Discovery against the configured issuer
+// happens here, before anything is stored, so a wrong or unreachable issuer is
+// reported as a rejected save. The returned apply is always usable: on a
+// discovery failure it installs everything except OIDC, which is what startup
+// wants (a provider that is briefly down must not stop local sign-in) and what
+// a save must not accept (the admin gets the error instead).
+func (m *Manager) Prepare(ctx context.Context, s settings.Settings) (func(), error) {
+	next := live{
+		sessionTTL:    s.General.SessionTTL.D(),
+		secureCookies: s.SecureCookies(),
+		localLogin:    s.OIDC.LocalLoginEnabled,
+		autoRegister:  s.OIDC.AutoRegister,
+	}
+	if s.ProxyAuth.Enabled {
+		nets, err := settings.ParseCIDRs(s.ProxyAuth.TrustedProxies)
+		if err != nil {
+			return nil, fmt.Errorf("trusted proxies: %w", err)
+		}
+		next.proxyHeader, next.trustedNets = s.ProxyAuth.Header, nets
+	}
+
+	var discoveryErr error
+	if s.OIDC.Configured() {
+		client, err := newOIDCClient(ctx, s)
+		if err != nil {
+			discoveryErr = err
+		} else {
+			next.oidc = client
+		}
+	}
+
+	return func() {
+		m.mu.Lock()
+		m.cur = next
+		m.mu.Unlock()
+		switch {
+		case next.oidc != nil:
+			log.Info().Str("issuer", s.OIDC.Issuer).Msg("OIDC login enabled")
+		case s.OIDC.Enabled:
+			log.Warn().Str("issuer", s.OIDC.Issuer).Msg("OIDC is configured but unavailable; local sign-in only")
+		}
+	}, discoveryErr
+}
+
+// snapshot returns the live configuration.
+func (m *Manager) snapshot() live {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cur
+}
+
+// Config returns the bootstrap configuration the manager was built with.
 func (m *Manager) Config() config.Config { return m.cfg }
 
-// OIDCEnabled reports whether OIDC login is available.
-func (m *Manager) OIDCEnabled() bool { return m.oidc != nil }
+// OIDCEnabled reports whether OIDC login is available right now.
+func (m *Manager) OIDCEnabled() bool { return m.snapshot().oidc != nil }
+
+// SessionTTL is how long a new session will last.
+func (m *Manager) SessionTTL() time.Duration { return m.snapshot().sessionTTL }
+
+// LocalLoginEnabled reports whether the password form may be offered.
+// GOBOOKSHELF_ADMIN_RECOVERY forces it on: it is the way back in when an
+// identity provider that is the only door stops opening.
+func (m *Manager) LocalLoginEnabled() bool {
+	return m.snapshot().localLogin || m.cfg.AdminRecovery
+}
 
 // ---------------------------------------------------------------- users ----
 
@@ -178,8 +255,12 @@ func (m *Manager) UserByID(ctx context.Context, id int64) (*User, error) {
 
 // UserByUsername looks up a user by username (case-insensitive).
 func (m *Manager) UserByUsername(ctx context.Context, username string) (*User, error) {
+	// Folded on both sides rather than with COLLATE NOCASE, which only SQLite
+	// understands. The parameter is cast because Postgres also has a
+	// range-valued lower(), and a bare placeholder inside the call would be
+	// ambiguous between the two overloads.
 	row := m.db.QueryRowContext(ctx,
-		`SELECT `+userColumns+` FROM users WHERE username = ? COLLATE NOCASE`, username)
+		`SELECT `+userColumns+` FROM users WHERE lower(username) = lower(CAST(? AS TEXT))`, username)
 	u, err := scanUser(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrNotFound
@@ -231,13 +312,9 @@ func (m *Manager) CreateUser(ctx context.Context, username, password, displayNam
 	if displayName == "" {
 		displayName = username
 	}
-	res, err := m.db.ExecContext(ctx,
+	id, err := m.db.InsertReturningID(ctx,
 		`INSERT INTO users (username, display_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)`,
 		username, displayName, hash, role, store.Now())
-	if err != nil {
-		return nil, err
-	}
-	id, err := res.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
@@ -292,6 +369,18 @@ func (m *Manager) DeleteUser(ctx context.Context, userID int64) error {
 	return err
 }
 
+// AdminsWithOIDC counts enabled administrators already linked to an identity
+// at the provider. It is what tells the settings handler whether turning the
+// password form off would leave a way back in.
+func (m *Manager) AdminsWithOIDC(ctx context.Context) (int, error) {
+	var n int
+	err := m.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM users
+		 WHERE role = ? AND disabled_at IS NULL AND oidc_subject IS NOT NULL AND oidc_subject <> ''`,
+		RoleAdmin).Scan(&n)
+	return n, err
+}
+
 // UserCount returns the number of accounts.
 func (m *Manager) UserCount(ctx context.Context) (int, error) {
 	var n int
@@ -336,7 +425,7 @@ func (m *Manager) SetLibraryAccess(ctx context.Context, userID int64, libraryIDs
 	}
 	for _, id := range libraryIDs {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO user_library_access (user_id, library_id) VALUES (?, ?)`, userID, id); err != nil {
+			`INSERT INTO user_library_access (user_id, library_id) VALUES (?, ?) ON CONFLICT DO NOTHING`, userID, id); err != nil {
 			return err
 		}
 	}
@@ -361,6 +450,9 @@ func (m *Manager) CanAccessLibrary(ctx context.Context, u *User, libraryID int64
 
 // Login verifies a username and password and creates a session.
 func (m *Manager) Login(ctx context.Context, username, password, userAgent, ip string) (*User, string, error) {
+	if !m.LocalLoginEnabled() {
+		return nil, "", ErrLocalLoginOff
+	}
 	if !m.loginLimiter.Allow(ip) {
 		return nil, "", ErrRateLimited
 	}
@@ -402,7 +494,7 @@ func (m *Manager) CreateSession(ctx context.Context, userID int64, userAgent, ip
 	if err != nil {
 		return "", err
 	}
-	expires := time.Now().Add(m.cfg.SessionTTL)
+	expires := time.Now().Add(m.SessionTTL())
 	_, err = m.db.ExecContext(ctx,
 		`INSERT INTO sessions (id, user_id, created_at, expires_at, user_agent, ip) VALUES (?, ?, ?, ?, ?, ?)`,
 		sid, userID, store.Now(), store.FormatTime(expires), truncate(userAgent, 512), ip)
@@ -426,14 +518,15 @@ func (m *Manager) PruneSessions(ctx context.Context) error {
 
 // SessionCookieFor builds the response cookie carrying a session id.
 func (m *Manager) SessionCookieFor(sid string) *http.Cookie {
+	cur := m.snapshot()
 	return &http.Cookie{
 		Name:     SessionCookie,
 		Value:    sid,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   m.cfg.SecureCookies,
+		Secure:   cur.secureCookies,
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(m.cfg.SessionTTL / time.Second),
+		MaxAge:   int(cur.sessionTTL / time.Second),
 	}
 }
 
@@ -444,7 +537,7 @@ func (m *Manager) ClearSessionCookie() *http.Cookie {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   m.cfg.SecureCookies,
+		Secure:   m.snapshot().secureCookies,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	}
@@ -479,13 +572,9 @@ func (m *Manager) CreateToken(ctx context.Context, userID int64, name string, sc
 		return APIToken{}, "", err
 	}
 	secret := TokenPrefix + base64.RawURLEncoding.EncodeToString(raw)
-	res, err := m.db.ExecContext(ctx,
+	id, err := m.db.InsertReturningID(ctx,
 		`INSERT INTO api_tokens (user_id, name, token_hash, scopes, created_at) VALUES (?, ?, ?, ?, ?)`,
 		userID, truncate(name, 128), hashToken(secret), strings.Join(clean, ","), store.Now())
-	if err != nil {
-		return APIToken{}, "", err
-	}
-	id, err := res.LastInsertId()
 	if err != nil {
 		return APIToken{}, "", err
 	}
@@ -557,7 +646,49 @@ func (m *Manager) EnsureSetupToken(ctx context.Context) (string, error) {
 	return token, nil
 }
 
+// CheckSetupToken reports whether the one-time token is the right one, without
+// spending it. The wizard uses it to fail its first step immediately instead of
+// waiting until the operator has also filled in an account.
+func (m *Manager) CheckSetupToken(ctx context.Context, token, ip string) error {
+	if !m.setupLimiter.Allow(ip) {
+		return ErrRateLimited
+	}
+	required, err := m.SetupRequired(ctx)
+	if err != nil {
+		return err
+	}
+	if !required {
+		return ErrSetupDone
+	}
+	return m.matchSetupToken(ctx, token)
+}
+
+// matchSetupToken compares token against the stored hash. It does no rate
+// limiting of its own; both callers have already spent an attempt.
+func (m *Manager) matchSetupToken(ctx context.Context, token string) error {
+	var storedHash string
+	err := m.db.QueryRowContext(ctx,
+		`SELECT token_hash FROM setup_state WHERE id = 1 AND used_at IS NULL`).Scan(&storedHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrSetupToken
+	}
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare([]byte(hashToken(token)), []byte(storedHash)) != 1 {
+		return ErrSetupToken
+	}
+	return nil
+}
+
 // Setup consumes the first-run token and creates the initial admin account.
+//
+// The token is claimed before the account is created, with a conditional
+// UPDATE whose row count is the claim: two requests arriving together both
+// pass the "no accounts yet" check, but only one of them can move used_at away
+// from NULL, so only one of them can go on to create an administrator. The
+// claim is released again if the account itself is refused - a password the
+// server rejects must not burn the only token the operator has.
 func (m *Manager) Setup(ctx context.Context, token, username, password, displayName, ip string) (*User, error) {
 	if !m.setupLimiter.Allow(ip) {
 		return nil, ErrRateLimited
@@ -569,22 +700,28 @@ func (m *Manager) Setup(ctx context.Context, token, username, password, displayN
 	if !required {
 		return nil, ErrSetupDone
 	}
-	var storedHash string
-	err = m.db.QueryRowContext(ctx, `SELECT token_hash FROM setup_state WHERE id = 1 AND used_at IS NULL`).Scan(&storedHash)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrSetupToken
+	// Compared in constant time first, so the value is never matched by the
+	// database's own byte-at-a-time comparison.
+	if err := m.matchSetupToken(ctx, token); err != nil {
+		return nil, err
 	}
+	res, err := m.db.ExecContext(ctx,
+		`UPDATE setup_state SET used_at = ? WHERE id = 1 AND used_at IS NULL`, store.Now())
 	if err != nil {
 		return nil, err
 	}
-	if hashToken(token) != storedHash {
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		if err != nil {
+			return nil, err
+		}
 		return nil, ErrSetupToken
 	}
 	u, err := m.CreateUser(ctx, username, password, displayName, RoleAdmin)
 	if err != nil {
-		return nil, err
-	}
-	if _, err := m.db.ExecContext(ctx, `UPDATE setup_state SET used_at = ? WHERE id = 1`, store.Now()); err != nil {
+		if _, relErr := m.db.ExecContext(ctx,
+			`UPDATE setup_state SET used_at = NULL WHERE id = 1`); relErr != nil {
+			log.Error().Err(relErr).Msg("releasing the setup token after a failed account creation")
+		}
 		return nil, err
 	}
 	return u, nil
@@ -686,17 +823,17 @@ func (m *Manager) identityFromToken(ctx context.Context, secret string) (*Identi
 // the request's immediate peer is inside trusted_proxies. Without that check
 // anyone able to reach the port could name any user.
 func (m *Manager) identityFromProxy(ctx context.Context, r *http.Request) (*Identity, error) {
-	header := m.cfg.ProxyAuthHeader
-	if header == "" {
+	cur := m.snapshot()
+	if cur.proxyHeader == "" {
 		return nil, ErrUnauthenticated
 	}
-	username := strings.TrimSpace(r.Header.Get(header))
+	username := strings.TrimSpace(r.Header.Get(cur.proxyHeader))
 	if username == "" {
 		return nil, ErrUnauthenticated
 	}
 	peer := PeerIP(r)
-	if !config.IPInNets(peer, m.cfg.TrustedProxyNets()) {
-		log.Warn().Str("peer", peer.String()).Str("header", header).
+	if !settings.IPInNets(peer, cur.trustedNets) {
+		log.Warn().Str("peer", peer.String()).Str("header", cur.proxyHeader).
 			Msg("ignoring proxy auth header from an untrusted source address")
 		return nil, ErrUnauthenticated
 	}

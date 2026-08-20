@@ -204,30 +204,40 @@ func (a *API) systemStatus(w http.ResponseWriter, r *http.Request) {
 			lastScans[l.ID] = &runs[0]
 		}
 	}
+	// Only a SQLite installation has a file to measure; a Postgres one reports
+	// zero rather than a number the admin page would have to caveat.
 	var dbSize int64
-	if info, err := os.Stat(a.cfg.DBPath); err == nil {
-		dbSize = info.Size()
+	if a.cfg.DBPath != "" {
+		if info, err := os.Stat(a.cfg.DBPath); err == nil {
+			dbSize = info.Size()
+		}
 	}
 	users, err := a.auth.UserCount(r.Context())
 	if err != nil {
 		fail(w, err, "system status")
 		return
 	}
+	set := a.settings.Get()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":       a.version,
 		"go_version":    goVersion(),
+		"db_driver":     a.cfg.DBDriver,
 		"db_path":       a.cfg.DBPath,
+		"db_dsn":        a.cfg.SafeDSN(),
 		"db_size_bytes": dbSize,
 		"data_dir":      a.cfg.DataDir,
 		"counts": map[string]int{
 			"ebooks":     counts[library.KindEbook],
 			"audiobooks": counts[library.KindAudiobook],
 		},
-		"libraries":    libs,
-		"users":        users,
-		"last_scans":   lastScans,
-		"oidc_enabled": a.auth.OIDCEnabled(),
-		"time":         time.Now().UTC().Format(time.RFC3339),
+		"libraries":           libs,
+		"users":               users,
+		"last_scans":          lastScans,
+		"oidc_enabled":        a.auth.OIDCEnabled(),
+		"local_login":         a.auth.LocalLoginEnabled(),
+		"settings_updated_at": set.UpdatedAt,
+		"base_url":            set.General.BaseURL,
+		"time":                time.Now().UTC().Format(time.RFC3339),
 	})
 }
 

@@ -13,7 +13,12 @@ import { announce } from '../live.js';
 
 /** @param {import('../router.js').RouteCtx} ctx */
 export default async function admin(ctx) {
-  const { el, body } = page('Admin');
+  const settingsLink = document.createElement('a');
+  settingsLink.className = 'btn';
+  settingsLink.href = '/admin/settings';
+  settingsLink.textContent = 'Settings';
+
+  const { el, body } = page('Admin', { actions: [settingsLink] });
 
   if (!store.isAdmin) {
     body.replaceChildren(emptyView(
@@ -407,10 +412,24 @@ async function renderStatus(host) {
       dl.append(d);
     };
     row('Version', s?.version || '');
-    row('Database', s?.db_size_bytes ? bytes(s.db_size_bytes) : '');
+    // Only a SQLite installation has a file to measure; a Postgres one is
+    // named rather than shown with a blank size.
+    row('Database', s?.db_driver === 'postgres'
+      ? 'Postgres'
+      : (s?.db_size_bytes ? 'SQLite, ' + bytes(s.db_size_bytes) : 'SQLite'));
     row('Ebooks', s?.counts?.ebooks != null ? String(s.counts.ebooks) : '');
     row('Audiobooks', s?.counts?.audiobooks != null ? String(s.counts.audiobooks) : '');
+    row('Base URL', s?.base_url || '');
+    row('Single sign-on', s?.oidc_enabled ? 'On' : 'Off');
+    row('Password sign-in', s?.local_login === false ? 'Off' : 'On');
+    row('Settings changed', s?.settings_updated_at || '');
     c.append(dl);
+
+    const link = document.createElement('a');
+    link.className = 'btn';
+    link.href = '/admin/settings';
+    link.textContent = 'Edit settings';
+    c.append(link);
     host.replaceChildren(c);
   } catch {
     host.replaceChildren();

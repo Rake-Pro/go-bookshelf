@@ -545,11 +545,12 @@ func TestSecurityCrossLibraryAccess(t *testing.T) {
 // configured, and when on it refuses anything but a public http(s) endpoint.
 func TestSecuritySSRF(t *testing.T) {
 	h := newHarness(t)
-	if h.cfg.MetadataProvider != "" {
-		t.Fatalf("no metadata provider should be configured by default, got %q", h.cfg.MetadataProvider)
+	meta := h.settings.Get().Metadata
+	if meta.Enabled() {
+		t.Fatalf("no metadata provider should be configured by default, got %q", meta.Provider)
 	}
 
-	disabled := remote.New(h.cfg.MetadataProvider != "", h.cfg.MetadataAllowPrivate)
+	disabled := remote.New(meta.Enabled(), meta.AllowPrivate)
 	if disabled.Enabled() {
 		t.Fatal("the fetcher must be disabled when no provider is configured")
 	}
@@ -667,7 +668,7 @@ func TestSecurityRateLimit(t *testing.T) {
 		}
 		limited := false
 		for i := 0; i < 25; i++ {
-			rec := h.do(http.MethodPost, "/api/v1/auth/setup",
+			rec := h.do(http.MethodPost, "/api/v1/setup/admin",
 				map[string]string{"token": "wrong", "username": "x", "password": "long-enough-password"},
 				withRemoteAddr("198.51.100.20:5000"))
 			if rec.Code == http.StatusTooManyRequests {

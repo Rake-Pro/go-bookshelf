@@ -114,7 +114,7 @@ func (a *API) opdsRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	feed := newFeed(a.cfg.BaseURL+"/opds", "go-bookshelf")
+	feed := newFeed(a.baseURL()+"/opds", "go-bookshelf")
 	feed.Links = []atomLink{
 		{Rel: "self", Href: "/opds", Type: opdsNavType},
 		{Rel: "start", Href: "/opds", Type: opdsNavType},
@@ -124,7 +124,7 @@ func (a *API) opdsRoot(w http.ResponseWriter, r *http.Request) {
 		href := "/opds/" + strconv.FormatInt(l.ID, 10)
 		feed.Entries = append(feed.Entries, atomEntry{
 			Title:   l.Name,
-			ID:      fmt.Sprintf("%s/opds/%d", a.cfg.BaseURL, l.ID),
+			ID:      fmt.Sprintf("%s/opds/%d", a.baseURL(), l.ID),
 			Updated: feed.Updated,
 			Content: &atomContent{Type: "text", Body: fmt.Sprintf("%d items", l.ItemCount)},
 			Links:   []atomLink{{Rel: "subsection", Href: href, Type: opdsAcquisitionType}},
@@ -167,7 +167,7 @@ func (a *API) opdsLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	feed := newFeed(fmt.Sprintf("%s/opds/%d", a.cfg.BaseURL, libID), lib.Name)
+	feed := newFeed(fmt.Sprintf("%s/opds/%d", a.baseURL(), libID), lib.Name)
 	feed.Links = []atomLink{
 		{Rel: "self", Href: "/opds/" + strconv.FormatInt(libID, 10), Type: opdsAcquisitionType},
 		{Rel: "start", Href: "/opds", Type: opdsNavType},
@@ -195,7 +195,7 @@ func (a *API) opdsSearch(w http.ResponseWriter, r *http.Request) {
 		fail(w, err, "opds search")
 		return
 	}
-	feed := newFeed(a.cfg.BaseURL+"/opds/search", "Search: "+query)
+	feed := newFeed(a.baseURL()+"/opds/search", "Search: "+query)
 	feed.Links = []atomLink{
 		{Rel: "self", Href: "/opds/search?q=" + urlQueryEscape(query), Type: opdsAcquisitionType},
 		{Rel: "start", Href: "/opds", Type: opdsNavType},
@@ -209,7 +209,7 @@ func (a *API) appendItemEntries(r *http.Request, feed *atomFeed, items []library
 		base := fmt.Sprintf("/api/v1/items/%d", it.ID)
 		entry := atomEntry{
 			Title:    it.Title,
-			ID:       fmt.Sprintf("%s/items/%d", a.cfg.BaseURL, it.ID),
+			ID:       fmt.Sprintf("%s/items/%d", a.baseURL(), it.ID),
 			Updated:  it.UpdatedAt,
 			Language: "",
 			Links: []atomLink{

@@ -43,10 +43,13 @@ const maxLimit = 200
 
 // sortClauses whitelists ORDER BY fragments; the sort parameter is never
 // interpolated into SQL directly.
+// Case-insensitive ordering is written as lower(x) rather than
+// COLLATE NOCASE: the collation is SQLite-only, while lower() means the same
+// thing to both backends.
 var sortClauses = map[string]string{
 	"added":  "i.added_at DESC, i.id DESC",
-	"title":  "i.sort_title COLLATE NOCASE ASC, i.id ASC",
-	"author": "(SELECT min(pe.sort_name) FROM item_people ip2 JOIN people pe ON pe.id = ip2.person_id WHERE ip2.item_id = i.id AND ip2.role = 'author') COLLATE NOCASE ASC, i.sort_title COLLATE NOCASE ASC",
+	"title":  "lower(i.sort_title) ASC, i.id ASC",
+	"author": "lower((SELECT min(pe.sort_name) FROM item_people ip2 JOIN people pe ON pe.id = ip2.person_id WHERE ip2.item_id = i.id AND ip2.role = 'author')) ASC, lower(i.sort_title) ASC",
 	"recent": "coalesce(pr.updated_at, '') DESC, i.added_at DESC",
 }
 
@@ -111,10 +114,12 @@ func (o ListOptions) buildFilter() (string, []any, bool) {
 		args = append(args, o.Kind)
 	}
 	if q := strings.TrimSpace(o.Query); q != "" {
-		pattern := "%" + escapeLike(q) + "%"
-		where = append(where, "(i.title LIKE ? ESCAPE '\\' OR i.subtitle LIKE ? ESCAPE '\\' OR i.description LIKE ? ESCAPE '\\'"+
-			" OR EXISTS (SELECT 1 FROM item_people ips JOIN people ps ON ps.id = ips.person_id WHERE ips.item_id = i.id AND ps.name LIKE ? ESCAPE '\\')"+
-			" OR EXISTS (SELECT 1 FROM item_series iss JOIN series se ON se.id = iss.series_id WHERE iss.item_id = i.id AND se.name LIKE ? ESCAPE '\\'))")
+		// LIKE is case-insensitive in SQLite and case-sensitive in Postgres,
+		// so both sides are folded rather than relying on either default.
+		pattern := likePattern(q)
+		where = append(where, "(lower(i.title) LIKE ? ESCAPE '\\' OR lower(i.subtitle) LIKE ? ESCAPE '\\' OR lower(i.description) LIKE ? ESCAPE '\\'"+
+			" OR EXISTS (SELECT 1 FROM item_people ips JOIN people ps ON ps.id = ips.person_id WHERE ips.item_id = i.id AND lower(ps.name) LIKE ? ESCAPE '\\')"+
+			" OR EXISTS (SELECT 1 FROM item_series iss JOIN series se ON se.id = iss.series_id WHERE iss.item_id = i.id AND lower(se.name) LIKE ? ESCAPE '\\'))")
 		args = append(args, pattern, pattern, pattern, pattern, pattern)
 	}
 	if !o.IncludeMissing {
@@ -129,7 +134,7 @@ func (o ListOptions) buildFilter() (string, []any, bool) {
 }
 
 const itemColumns = `i.id, i.library_id, i.kind, i.title, i.sort_title, i.subtitle,
-	i.cover_path, i.duration_ms, i.size_bytes, i.added_at, i.updated_at, coalesce(i.missing_at, '')`
+	i.has_cover, i.duration_ms, i.size_bytes, i.added_at, i.updated_at, coalesce(i.missing_at, '')`
 
 // ListItems returns a page of items plus the total matching count.
 func (c *Catalog) ListItems(ctx context.Context, o ListOptions) ([]Item, int, error) {
@@ -166,15 +171,15 @@ func scanItems(rows *sql.Rows) ([]Item, error) {
 	for rows.Next() {
 		var (
 			it        Item
-			coverPath string
+			hasCover  int
 			missingAt string
 		)
 		if err := rows.Scan(&it.ID, &it.LibraryID, &it.Kind, &it.Title, &it.SortTitle, &it.Subtitle,
-			&coverPath, &it.DurationMS, &it.SizeBytes, &it.AddedAt, &it.UpdatedAt, &missingAt); err != nil {
+			&hasCover, &it.DurationMS, &it.SizeBytes, &it.AddedAt, &it.UpdatedAt, &missingAt); err != nil {
 			return nil, err
 		}
 		it.Missing = missingAt != ""
-		if coverPath != "" {
+		if hasCover != 0 {
 			it.CoverURL = "/api/v1/items/" + strconv.FormatInt(it.ID, 10) + "/cover"
 		}
 		it.Authors = []string{}
@@ -295,11 +300,11 @@ func (c *Catalog) Item(ctx context.Context, itemID, userID int64) (*ItemDetail, 
 
 	var (
 		d         ItemDetail
-		coverPath string
+		hasCover  int
 		missingAt string
 	)
 	err := row.Scan(&d.ID, &d.LibraryID, &d.Kind, &d.Title, &d.SortTitle, &d.Subtitle,
-		&coverPath, &d.DurationMS, &d.SizeBytes, &d.AddedAt, &d.UpdatedAt, &missingAt,
+		&hasCover, &d.DurationMS, &d.SizeBytes, &d.AddedAt, &d.UpdatedAt, &missingAt,
 		&d.Description, &d.Language, &d.Published, &d.ISBN, &d.ASIN, &d.Publisher)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrNotFound
@@ -314,7 +319,7 @@ func (c *Catalog) Item(ctx context.Context, itemID, userID int64) (*ItemDetail, 
 	d.Tags = []TagRef{}
 	d.Files = []FileRef{}
 	base := "/api/v1/items/" + strconv.FormatInt(d.ID, 10)
-	if coverPath != "" {
+	if hasCover != 0 {
 		d.CoverURL = base + "/cover"
 	}
 	d.DownloadURL = base + "/download"
@@ -488,19 +493,16 @@ func (c *Catalog) ItemFilePaths(ctx context.Context, itemID int64) ([]string, er
 	return paths, rows.Err()
 }
 
-// CoverPath returns the cached cover file for an item, if any.
-func (c *Catalog) CoverPath(ctx context.Context, itemID int64) (string, error) {
-	var path string
-	err := c.db.QueryRowContext(ctx, `SELECT cover_path FROM items WHERE id = ?`, itemID).Scan(&path)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", store.ErrNotFound
-	}
-	return path, err
-}
-
 func escapeLike(s string) string {
 	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 	return r.Replace(s)
+}
+
+// likePattern builds the argument for a `lower(column) LIKE ?` comparison: the
+// wildcards the user did not type are escaped, and the whole thing is folded
+// to match the folded column.
+func likePattern(q string) string {
+	return "%" + strings.ToLower(escapeLike(q)) + "%"
 }
 
 func baseName(p string) string {

@@ -17,7 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Build, vet, and the full test suite.
+  # Build, vet, and the full test suite on the default backend. The Postgres
+  # halves of the dialect tests skip themselves when the DSN is unset.
   test-sqlite:
     runs-on: ubuntu-latest
     steps:
@@ -41,8 +42,46 @@ jobs:
       - name: smoke
         run: ./scripts/smoke.sh
 
+  # The same suite against a real Postgres. GOBOOKSHELF_TEST_POSTGRES_DSN
+  # switches every test database - including the ones the API contract tests
+  # build - onto Postgres, so this job is the whole application running on the
+  # other backend rather than a handful of extra assertions.
+  test-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: bookshelf_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      GOBOOKSHELF_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/bookshelf_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: test (postgres)
+        run: go test ./... -count=1
+      - name: smoke (postgres)
+        env:
+          GOBOOKSHELF_DB_DSN: postgres://postgres:postgres@localhost:5432/bookshelf_smoke?sslmode=disable
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c 'DROP DATABASE IF EXISTS bookshelf_smoke'
+          PGPASSWORD=postgres psql -h localhost -U postgres -c 'CREATE DATABASE bookshelf_smoke'
+          ./scripts/smoke.sh --driver postgres
+
   build:
-    needs: [test-sqlite]
+    needs: [test-sqlite, test-postgres]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

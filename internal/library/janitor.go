@@ -63,7 +63,8 @@ func (j *Janitor) Run(ctx context.Context) (int, error) {
 		if _, err := j.cat.db.ExecContext(ctx,
 			`INSERT INTO progress_archive
 				(user_id, library_id, source_key, locator, position_ms, percent, finished_at, device, archived_at)
-			 SELECT user_id, ?, ?, locator, position_ms, percent, finished_at, device, ?
+			 SELECT user_id, CAST(? AS BIGINT), CAST(? AS TEXT), locator, position_ms, percent,
+				finished_at, device, CAST(? AS TEXT)
 			 FROM progress WHERE item_id = ?
 			 ON CONFLICT(user_id, library_id, source_key) DO UPDATE SET
 				locator = excluded.locator, position_ms = excluded.position_ms,
@@ -113,10 +114,15 @@ func (j *Janitor) Start(ctx context.Context, every time.Duration) {
 
 // restoreProgress re-attaches archived reading positions to a freshly ingested
 // item that came back at the same path.
+//
+// The parameters in the SELECT list are cast explicitly: they sit in a
+// projection rather than next to the column they feed, which is the one shape
+// Postgres cannot infer a parameter type for. CAST is understood by both
+// backends, so the statement stays single-sourced.
 func (s *Scanner) restoreProgress(ctx context.Context, itemID, libraryID int64, sourceKey string) error {
 	if _, err := s.cat.db.ExecContext(ctx,
 		`INSERT INTO progress (user_id, item_id, locator, position_ms, percent, finished_at, device, updated_at)
-		 SELECT user_id, ?, locator, position_ms, percent, finished_at, device, ?
+		 SELECT user_id, CAST(? AS BIGINT), locator, position_ms, percent, finished_at, device, CAST(? AS TEXT)
 		 FROM progress_archive WHERE library_id = ? AND source_key = ?
 		 ON CONFLICT(user_id, item_id) DO NOTHING`,
 		itemID, store.Now(), libraryID, sourceKey); err != nil {

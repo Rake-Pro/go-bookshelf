@@ -2,14 +2,19 @@ package auth_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/rake-pro/go-bookshelf/internal/auth"
 	"github.com/rake-pro/go-bookshelf/internal/config"
+	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
+	"github.com/rake-pro/go-bookshelf/internal/storetest"
 )
 
 func testParams() auth.ArgonParams {
@@ -21,19 +26,17 @@ func newManager(t *testing.T) (*auth.Manager, *store.DB, context.Context) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	db, err := store.Open(ctx, filepath.Join(dir, "auth.db"))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t)
 
 	auth.DefaultArgonParams = testParams()
 	cfg := config.Default()
 	cfg.DBPath = filepath.Join(dir, "auth.db")
-	mgr, err := auth.New(ctx, db, cfg)
+	mgr := auth.New(db, cfg)
+	apply, err := mgr.Prepare(ctx, settings.Default())
 	if err != nil {
-		t.Fatalf("manager: %v", err)
+		t.Fatalf("prepare: %v", err)
 	}
+	apply()
 	return mgr, db, ctx
 }
 
@@ -138,6 +141,71 @@ func TestSetupTokenIsSingleUseAndHashed(t *testing.T) {
 	}
 	if again != "" {
 		t.Error("a setup token was issued after setup completed")
+	}
+}
+
+// Concurrent setup attempts must produce exactly one administrator. The
+// "no accounts yet" check is not enough on its own - two requests can both pass
+// it - so the token is claimed with a conditional update that only one of them
+// can win.
+func TestSetupTokenIsSpentExactlyOnceUnderConcurrency(t *testing.T) {
+	mgr, _, ctx := newManager(t)
+
+	token, err := mgr.EnsureSetupToken(ctx)
+	if err != nil || token == "" {
+		t.Fatalf("token = %q, %v", token, err)
+	}
+
+	const attempts = 8
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		created []string
+	)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// A username each, so the unique index is not what serialises them.
+			name := fmt.Sprintf("admin%d", i)
+			u, err := mgr.Setup(ctx, token, name, "correct-horse-battery", name, "127.0.0.1")
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			created = append(created, u.Username)
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+
+	if len(created) != 1 {
+		t.Fatalf("setup created %d administrators (%v), want exactly 1", len(created), created)
+	}
+	users, err := mgr.ListUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 {
+		t.Errorf("users table holds %d rows, want 1", len(users))
+	}
+}
+
+// A rejected account must not burn the token: the operator has only the one,
+// and a password the server refuses is their mistake to correct, not a reason
+// to restart the server.
+func TestSetupTokenSurvivesARejectedAccount(t *testing.T) {
+	mgr, _, ctx := newManager(t)
+
+	token, err := mgr.EnsureSetupToken(ctx)
+	if err != nil || token == "" {
+		t.Fatalf("token = %q, %v", token, err)
+	}
+	if _, err := mgr.Setup(ctx, token, "admin", "short", "Admin", "127.0.0.1"); !errors.Is(err, auth.ErrWeakPassword) {
+		t.Fatalf("short password = %v, want ErrWeakPassword", err)
+	}
+	if _, err := mgr.Setup(ctx, token, "admin", "correct-horse-battery", "Admin", "127.0.0.1"); err != nil {
+		t.Fatalf("the token was spent by the rejected attempt: %v", err)
 	}
 }
 

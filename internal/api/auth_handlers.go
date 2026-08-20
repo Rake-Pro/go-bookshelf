@@ -20,59 +20,21 @@ type meResponse struct {
 	AuthMethod  string  `json:"auth_method"`
 }
 
-// authStatus tells the login page what it may offer. It is deliberately
-// public and reveals nothing beyond which login methods exist.
+// authStatus tells the login page and the wizard what they may offer. It is
+// deliberately public and reveals nothing beyond which sign-in methods exist
+// and whether the server has been set up.
 func (a *API) authStatus(w http.ResponseWriter, r *http.Request) {
-	required, err := a.auth.SetupRequired(r.Context())
-	if err != nil {
-		fail(w, err, "setup status")
-		return
-	}
+	complete := a.settings.SetupComplete()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"setup_required": required,
+		// setup_required stays the flag the client redirects on; setup_complete
+		// is its positive form, which is what the wizard's own steps read.
+		"setup_required": !complete,
+		"setup_complete": complete,
 		"oidc_enabled":   a.auth.OIDCEnabled(),
 		"oidc_start_url": "/api/v1/auth/oidc/start",
+		"local_login":    a.auth.LocalLoginEnabled(),
 		"version":        a.version,
 	})
-}
-
-func (a *API) authSetup(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Token       string `json:"token"`
-		Username    string `json:"username"`
-		Password    string `json:"password"`
-		DisplayName string `json:"display_name"`
-	}
-	if !decodeJSON(w, r, &body) {
-		return
-	}
-	user, err := a.auth.Setup(r.Context(), body.Token, body.Username, body.Password, body.DisplayName, auth.ClientIP(r))
-	switch {
-	case errors.Is(err, auth.ErrRateLimited):
-		writeError(w, http.StatusTooManyRequests, codeRateLimited, "too many setup attempts; try again later")
-		return
-	case errors.Is(err, auth.ErrSetupDone):
-		writeError(w, http.StatusConflict, codeConflict, "setup has already been completed")
-		return
-	case errors.Is(err, auth.ErrSetupToken):
-		writeError(w, http.StatusForbidden, codeForbidden, "invalid setup token")
-		return
-	case errors.Is(err, auth.ErrWeakPassword):
-		writeError(w, http.StatusBadRequest, codeBadRequest, auth.ErrWeakPassword.Error())
-		return
-	case err != nil:
-		fail(w, err, "setup")
-		return
-	}
-
-	sid, err := a.auth.CreateSession(r.Context(), user.ID, r.UserAgent(), auth.ClientIP(r))
-	if err != nil {
-		fail(w, err, "setup session")
-		return
-	}
-	http.SetCookie(w, a.auth.SessionCookieFor(sid))
-	log.Info().Str("username", user.Username).Msg("first-run setup completed")
-	a.writeMe(w, r, &auth.Identity{User: user, Method: "session"})
 }
 
 func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
@@ -85,6 +47,10 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	user, sid, err := a.auth.Login(r.Context(), body.Username, body.Password, r.UserAgent(), auth.ClientIP(r))
 	switch {
+	case errors.Is(err, auth.ErrLocalLoginOff):
+		writeError(w, http.StatusForbidden, codeForbidden,
+			"password sign-in is turned off on this server; use the single sign-on button")
+		return
 	case errors.Is(err, auth.ErrRateLimited):
 		writeError(w, http.StatusTooManyRequests, codeRateLimited, "too many login attempts; try again later")
 		return
@@ -167,6 +133,14 @@ func (a *API) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, auth.ErrDisabled):
 		writeError(w, http.StatusForbidden, codeForbidden, "this account is disabled")
+		return
+	case errors.Is(err, auth.ErrNotAuthorized):
+		writeError(w, http.StatusForbidden, codeForbidden,
+			"your account is not authorized for this application")
+		return
+	case errors.Is(err, auth.ErrNoAccount):
+		writeError(w, http.StatusForbidden, codeForbidden,
+			"this server does not create accounts automatically; ask an administrator for one")
 		return
 	case err != nil:
 		log.Warn().Err(err).Msg("OIDC callback failed")
