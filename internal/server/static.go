@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"io/fs"
 	"net/http"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -16,10 +18,34 @@ var startTime = time.Now()
 // registerStatic serves the embedded single-page application. Anything that is
 // not an API route, a known file, or an asset request falls back to index.html
 // so client-side routing works on a hard refresh.
-func registerStatic(mux *http.ServeMux, dist fs.FS) {
+func registerStatic(mux *http.ServeMux, dist fs.FS, version string) {
+	sw := stampedServiceWorker(dist, version)
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		if sw != nil && path.Clean("/"+r.URL.Path) == "/sw.js" {
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			http.ServeContent(w, r, "sw.js", startTime, bytes.NewReader(sw))
+			return
+		}
 		serveSPA(w, r, dist)
 	})
+}
+
+var swVersionRe = regexp.MustCompile(`(?m)^const VERSION = '[^']*';`)
+
+// stampedServiceWorker rewrites the service worker's cache VERSION to the build
+// version, so every release invalidates the cached shell without anyone having
+// to remember to bump a constant. A dev build keeps the file's own value. Nil
+// when the worker is absent (tests with a stub frontend).
+func stampedServiceWorker(dist fs.FS, version string) []byte {
+	src, err := fs.ReadFile(dist, "sw.js")
+	if err != nil {
+		return nil
+	}
+	if version == "" || version == "dev" || strings.ContainsAny(version, "'\\\n") {
+		return src
+	}
+	return swVersionRe.ReplaceAll(src, []byte("const VERSION = '"+version+"';"))
 }
 
 func serveSPA(w http.ResponseWriter, r *http.Request, dist fs.FS) {

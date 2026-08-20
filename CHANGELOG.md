@@ -7,6 +7,11 @@ All notable changes to this project are recorded here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Service worker: the cache version is now stamped with the build version at
+  serve time. 0.2.1 shipped frontend fixes that installed clients never
+  received because the worker's cache key had not changed.
+
+### Fixed
 - Reader: the book never rendered in a browser. Four causes, all client side:
   the application CSP did not allow `blob:` frames, styles and fonts that the
   renderer uses for chapter documents; the injected per-chapter CSP `<meta>`

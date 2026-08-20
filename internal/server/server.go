@@ -29,7 +29,7 @@ func New(a *api.API, authMgr *auth.Manager, set *settings.Service, dist fs.FS) h
 	mux := http.NewServeMux()
 	a.Register(mux)
 	a.RegisterRoot(mux)
-	registerStatic(mux, dist)
+	registerStatic(mux, dist, a.Version())
 
 	return chain(mux,
 		recoverPanic,
