@@ -251,7 +251,7 @@ func (a *API) listCollections(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := a.db.QueryContext(r.Context(),
 		`SELECT c.id, c.name, c.user_id, (SELECT count(*) FROM collection_items ci WHERE ci.collection_id = c.id)
-		 FROM collections c WHERE c.user_id IS NULL OR c.user_id = ? ORDER BY c.name COLLATE NOCASE`, id.User.ID)
+		 FROM collections c WHERE c.user_id IS NULL OR c.user_id = ? ORDER BY lower(c.name)`, id.User.ID)
 	if err != nil {
 		fail(w, err, "collections")
 		return
@@ -297,13 +297,8 @@ func (a *API) createCollection(w http.ResponseWriter, r *http.Request) {
 	if body.Shared {
 		owner = nil
 	}
-	res, err := a.db.ExecContext(r.Context(),
+	newID, err := a.db.InsertReturningID(r.Context(),
 		`INSERT INTO collections (user_id, name) VALUES (?, ?)`, owner, body.Name)
-	if err != nil {
-		fail(w, err, "create collection")
-		return
-	}
-	newID, err := res.LastInsertId()
 	if err != nil {
 		fail(w, err, "create collection")
 		return

@@ -8,6 +8,7 @@ import (
 
 	"github.com/rake-pro/go-bookshelf/internal/auth"
 	"github.com/rake-pro/go-bookshelf/internal/library"
+	"github.com/rake-pro/go-bookshelf/internal/store"
 	"github.com/rs/zerolog/log"
 )
 
@@ -204,30 +205,48 @@ func (a *API) systemStatus(w http.ResponseWriter, r *http.Request) {
 			lastScans[l.ID] = &runs[0]
 		}
 	}
+	// SQLite: size of the database file. Postgres: pg_database_size of the
+	// connected database (includes indexes and cover bytes).
 	var dbSize int64
-	if info, err := os.Stat(a.cfg.DBPath); err == nil {
-		dbSize = info.Size()
+	switch a.db.Dialect().Name() {
+	case store.DriverPostgres:
+		if err := a.db.QueryRowContext(r.Context(),
+			`SELECT pg_database_size(current_database())`).Scan(&dbSize); err != nil {
+			dbSize = 0
+		}
+	default:
+		if a.cfg.DBPath != "" {
+			if info, err := os.Stat(a.cfg.DBPath); err == nil {
+				dbSize = info.Size()
+			}
+		}
 	}
 	users, err := a.auth.UserCount(r.Context())
 	if err != nil {
 		fail(w, err, "system status")
 		return
 	}
+	set := a.settings.Get()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":       a.version,
 		"go_version":    goVersion(),
+		"db_driver":     a.cfg.DBDriver,
 		"db_path":       a.cfg.DBPath,
+		"db_dsn":        a.cfg.SafeDSN(),
 		"db_size_bytes": dbSize,
 		"data_dir":      a.cfg.DataDir,
 		"counts": map[string]int{
 			"ebooks":     counts[library.KindEbook],
 			"audiobooks": counts[library.KindAudiobook],
 		},
-		"libraries":    libs,
-		"users":        users,
-		"last_scans":   lastScans,
-		"oidc_enabled": a.auth.OIDCEnabled(),
-		"time":         time.Now().UTC().Format(time.RFC3339),
+		"libraries":           libs,
+		"users":               users,
+		"last_scans":          lastScans,
+		"oidc_enabled":        a.auth.OIDCEnabled(),
+		"local_login":         a.auth.LocalLoginEnabled(),
+		"settings_updated_at": set.UpdatedAt,
+		"base_url":            set.General.BaseURL,
+		"time":                time.Now().UTC().Format(time.RFC3339),
 	})
 }
 

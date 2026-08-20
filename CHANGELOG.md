@@ -6,7 +6,112 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Postgres storage backend.** `GOBOOKSHELF_DB_DRIVER=postgres` with
+  `GOBOOKSHELF_DB_DSN` runs the whole application on Postgres instead of SQLite;
+  SQLite stays the default and is unchanged. The schema is shipped per dialect
+  under `internal/store/migrations/{sqlite,postgres}/` and migrates on startup
+  either way. The DSN may carry a password, so it is only ever logged - and only
+  ever reported on the admin page - with the password replaced.
+- **Cover images are stored in the database**, as two bounded JPEGs per book: a
+  thumbnail at most 400px on its longest side and a full render at most 1600px.
+  `GET /api/v1/items/{id}/cover` serves them with the same caching headers as
+  before.
+- `GOBOOKSHELF_TEST_POSTGRES_DSN` re-runs the entire test suite - the API and
+  frontend contract tests included - against a real Postgres, and CI does so in
+  a `postgres:17` job. `scripts/smoke.sh --driver postgres` drives the built
+  binary against one with no data directory at all.
+- First-run wizard at `/setup`: the one-time token, the administrator account,
+  the base URL (prefilled from the request's forwarding headers), single sign-on
+  with a **Test** button that runs discovery without saving, and the first
+  library with a path the server checks exists. The last two can be skipped.
+- Admin settings page at `/admin/settings`, one card per group, each saving on
+  its own, with the same validation as the wizard and a live-region status.
+- `GET|PUT /api/v1/admin/settings` and `POST /api/v1/admin/settings/oidc/test`.
+- Single sign-on group mapping for both roles: an **admin group** grants the
+  administrator role, and a **user group**, when set, is the requirement for
+  signing in at all - an identity in neither is refused and no account is
+  created for it. Roles are re-evaluated on every sign-in, except for
+  `restricted` accounts and for an administrator who still has a local password,
+  which are never rewritten.
+- Password sign-in can be turned off once single sign-on is working, guarded so
+  it cannot leave the server with no way in, and overridable with
+  `GOBOOKSHELF_ADMIN_RECOVERY`.
+- Automatic account creation on single sign-on is now optional.
+- `GET /api/v1/auth/status` reports `setup_complete` and `local_login`;
+  `GET /api/v1/system/status` reports `local_login`, `settings_updated_at` and
+  `base_url`.
+- `internal/oidctest`, a minimal OpenID Connect provider used by the tests, so
+  sign-in is exercised through real discovery, code exchange and token
+  verification rather than against internal helpers.
+
+### Changed
+
+- **`GOBOOKSHELF_DATA_DIR` is now optional and defaults to empty.** When it is
+  set it is a write-through cache for cover images and nothing else; when it is
+  not, the server writes nothing to local disk. Combined with Postgres this
+  means a deployment needs no writable volume and can be rescheduled onto any
+  node: the catalog, users, sessions, API tokens, reading positions, bookmarks,
+  the settings document, the first-run setup token, scan history and the cover
+  artwork are all in the database, and the media mount is read-only.
+- `GOBOOKSHELF_DB_PATH` is refused when the driver is `postgres`, and
+  `GOBOOKSHELF_DB_DSN` when it is `sqlite`, rather than being silently ignored.
+- `GET /api/v1/system/status` reports `db_driver` and a redacted `db_dsn`.
+  `db_size_bytes` is zero on Postgres, which has no single file to measure.
+- Full-size covers are now rendered up to 1600px rather than 1400px.
+- **Breaking: application configuration moved out of the environment and into
+  the app.** Single sign-on, the external base URL, cookie and session
+  behaviour, the background scan interval, reverse-proxy authentication, the
+  online metadata provider and the `/metrics` allow list are now entered in a
+  setup wizard on first run, edited afterwards at **Admin -> Settings**, and
+  stored in the database. A save applies to the running server; nothing needs a
+  restart.
+- **Breaking: the environment carries only what must be known before the
+  database is open**: `GOBOOKSHELF_SECRETS_KEY` (new, required),
+  `GOBOOKSHELF_LISTEN`, `GOBOOKSHELF_DB_DRIVER`, `GOBOOKSHELF_DB_PATH`,
+  `GOBOOKSHELF_DB_DSN`, `GOBOOKSHELF_DATA_DIR`, `GOBOOKSHELF_LOG_LEVEL`,
+  `GOBOOKSHELF_CONFIG`, `GOBOOKSHELF_ADMIN_RECOVERY` and the development-only
+  `GOBOOKSHELF_DEV_INSECURE_KEY`. Every other `GOBOOKSHELF_*` variable, and its
+  YAML key, is gone; an unknown key in the config file is now refused rather
+  than ignored.
+- **Breaking: `POST /api/v1/auth/setup` is replaced by
+  `POST /api/v1/setup/{step}`** - `token`, `admin`, `base-url`, `oidc`,
+  `library`, `complete`.
+- Until first-run setup is complete, every `/api/v1` route other than the wizard
+  and the public probes answers `403 setup_required`.
+
+**Upgrading from configuration in the environment.** Set
+`GOBOOKSHELF_SECRETS_KEY` to 32 base64 bytes (`openssl rand -base64 32`) and
+drop the variables that are gone. A database that
+already has accounts starts with setup marked complete, so no wizard appears and
+nothing is gated - but the OIDC settings do not migrate: re-enter the issuer,
+client id, client secret and group names at **Admin -> Settings**. Until you do,
+sign-in is password-only. If single sign-on locks you out, restart with
+`GOBOOKSHELF_ADMIN_RECOVERY=true`.
+
+**Upgrading to Postgres, or to no data directory.** Nothing to do for a SQLite
+installation: the new migration adds the cover table and converts
+`items.cover_path` into a flag, and existing covers keep being served from the
+cache under `GOBOOKSHELF_DATA_DIR` until the next scan re-ingests each book and
+writes its artwork into the database. If you have already cleared that
+directory, rescan the library to regenerate the covers. Moving an existing
+installation to Postgres is not migrated for you: point it at an empty database
+and rescan.
+
+### Security
+
+- The OIDC client secret is AES-256-GCM encrypted at rest under
+  `GOBOOKSHELF_SECRETS_KEY`, with a fresh nonce per write. The API reports only
+  `has_client_secret` and never the value; an empty value on write keeps the
+  stored one. A missing, wrong-length or wrong key is a hard failure with an
+  actionable message rather than a server that looks unconfigured.
+- A settings save runs OIDC discovery before persisting anything, so an issuer
+  that does not answer is a 400 carrying the provider's error and leaves both
+  the stored document and the running configuration untouched.
+- `GOBOOKSHELF_ADMIN_RECOVERY` is environment-only by design: re-enabling the
+  password path takes a restart, so it is not reachable from a compromised admin
+  session.
 
 ## [0.1.0] - 2026-08-20
 

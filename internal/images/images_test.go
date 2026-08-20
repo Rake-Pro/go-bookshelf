@@ -69,29 +69,33 @@ func TestDecodeRejectsPixelBomb(t *testing.T) {
 	}
 }
 
-func TestStoreSavesBothSizes(t *testing.T) {
+func TestCacheHoldsBothVariants(t *testing.T) {
 	dir := t.TempDir()
-	store, err := images.NewStore(filepath.Join(dir, "covers"))
+	cache, err := images.NewStore(filepath.Join(dir, "covers"))
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
+	if !cache.Enabled() {
+		t.Fatal("a store built from a real directory must be enabled")
+	}
 	src := fixtures.PNG(900, 1200, color.RGBA{G: 200, A: 255})
 
-	full, err := store.Save(context.Background(), 42, "full", src)
-	if err != nil {
-		t.Fatalf("save full: %v", err)
+	for _, variant := range []string{images.VariantFull, images.VariantThumb} {
+		encoded, err := images.Convert(context.Background(), src, images.MaxDim(variant))
+		if err != nil {
+			t.Fatalf("convert %s: %v", variant, err)
+		}
+		if err := cache.Put(42, variant, encoded); err != nil {
+			t.Fatalf("put %s: %v", variant, err)
+		}
 	}
-	thumb, err := store.Save(context.Background(), 42, "thumb", src)
-	if err != nil {
-		t.Fatalf("save thumb: %v", err)
-	}
-	if full == thumb {
-		t.Fatal("both sizes were written to the same path")
+	if cache.Path(42, images.VariantFull) == cache.Path(42, images.VariantThumb) {
+		t.Fatal("both variants were written to the same path")
 	}
 
-	thumbBytes, err := os.ReadFile(thumb)
-	if err != nil {
-		t.Fatal(err)
+	thumbBytes, _, ok := cache.Read(42, images.VariantThumb)
+	if !ok {
+		t.Fatal("the thumbnail was not readable back")
 	}
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(thumbBytes))
 	if err != nil {
@@ -104,8 +108,49 @@ func TestStoreSavesBothSizes(t *testing.T) {
 		t.Errorf("thumb height = %d, want at most %d", cfg.Height, images.ThumbMaxDim)
 	}
 
-	store.Remove(42)
-	if _, err := os.Stat(full); err == nil {
+	cache.Remove(42)
+	if _, err := os.Stat(cache.Path(42, images.VariantFull)); err == nil {
 		t.Error("Remove left the full-size cover behind")
+	}
+}
+
+// Without a data directory the cache is inert: nothing is written, nothing is
+// read back, and no method panics. This is the configuration a deployment with
+// no local volume runs in.
+func TestDisabledCacheWritesNothing(t *testing.T) {
+	cache, err := images.NewStore("")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if cache.Enabled() {
+		t.Fatal("a store built from an empty directory must be disabled")
+	}
+	if cache.Dir() != "" || cache.Path(1, images.VariantFull) != "" {
+		t.Errorf("a disabled cache named a path: dir=%q path=%q", cache.Dir(), cache.Path(1, images.VariantFull))
+	}
+	if err := cache.Put(1, images.VariantFull, []byte("data")); err != nil {
+		t.Errorf("put on a disabled cache = %v, want nil", err)
+	}
+	if _, _, ok := cache.Read(1, images.VariantFull); ok {
+		t.Error("a disabled cache reported a hit")
+	}
+	cache.Remove(1)
+}
+
+func TestVariantAndMaxDim(t *testing.T) {
+	if got := images.Variant("thumb"); got != images.VariantThumb {
+		t.Errorf("Variant(thumb) = %q", got)
+	}
+	for _, in := range []string{"", "full", "nonsense", "THUMB"} {
+		if got := images.Variant(in); got != images.VariantFull {
+			t.Errorf("Variant(%q) = %q, want full", in, got)
+		}
+	}
+	if images.MaxDim(images.VariantThumb) != images.ThumbMaxDim ||
+		images.MaxDim(images.VariantFull) != images.FullMaxDim {
+		t.Error("MaxDim does not follow the variant")
+	}
+	if images.ThumbMaxDim > 400 || images.FullMaxDim > 1600 {
+		t.Errorf("cover bounds grew: thumb=%d full=%d", images.ThumbMaxDim, images.FullMaxDim)
 	}
 }

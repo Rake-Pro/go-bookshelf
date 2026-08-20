@@ -2,9 +2,12 @@
  * Sign in.
  *
  * The "Sign in with SSO" button is shown only when the auth probe says the
- * server has OIDC configured. The probe is `GET /api/v1/auth/me` followed, when
- * that answers 401, by the public `GET /api/v1/auth/status`.
- * See docs/FRONTEND.md.
+ * server has OIDC configured, and the password form is hidden when the same
+ * probe says local sign-in has been turned off. The probe is
+ * `GET /api/v1/auth/me` followed, when that answers 401, by the public
+ * `GET /api/v1/auth/status`. See docs/FRONTEND.md.
+ *
+ * Both flags come from the server; there is nothing to configure here.
  */
 
 import { auth, probeAuth, ApiError } from '../api.js';
@@ -85,9 +88,10 @@ export default async function login(ctx) {
     errBox.hidden = false;
   }
 
-  /* Probe for OIDC and first-run state. */
+  /* Probe for OIDC, local sign-in and first-run state. */
+  let focusForm = true;
   try {
-    const { oidc, setupRequired, user } = await probeAuth();
+    const { oidc, setupRequired, localLogin, user } = await probeAuth();
     if (user) { navigate(next.startsWith('/') ? next : '/', { replace: true }); }
     if (setupRequired) {
       const notice = document.createElement('p');
@@ -95,24 +99,39 @@ export default async function login(ctx) {
       const a = document.createElement('a');
       a.href = '/setup';
       a.textContent = 'Finish first-run setup';
-      notice.append('This server has no accounts yet. ', a, '.');
+      notice.append('This server has not been set up yet. ', a, '.');
       card.append(notice);
     }
     if (oidc) {
-      const div = document.createElement('div');
-      div.className = 'divider';
-      div.textContent = 'or';
       const sso = document.createElement('a');
-      sso.className = 'btn btn--lg';
+      sso.className = 'btn btn--primary btn--lg';
       sso.style.width = '100%';
       sso.href = auth.oidcStartUrl();
       sso.textContent = 'Sign in with SSO';
-      card.append(div, sso);
+      if (localLogin) {
+        const div = document.createElement('div');
+        div.className = 'divider';
+        div.textContent = 'or';
+        card.append(div, sso);
+      } else {
+        // Single sign-on is the only way in, so it leads rather than follows.
+        card.insertBefore(sso, form);
+      }
+    }
+    if (!localLogin) {
+      form.hidden = true;
+      focusForm = false;
+      lead.textContent = oidc
+        ? 'Sign in with your organisation account.'
+        : 'Sign-in is unavailable: no sign-in method is configured on this server.';
+      queueMicrotask(() => h1.focus());
     }
   } catch { /* probe failure only hides the SSO button */ }
 
   wrap.append(card);
-  queueMicrotask(() => /** @type {HTMLElement|null} */ (form.querySelector('input'))?.focus());
+  if (focusForm) {
+    queueMicrotask(() => /** @type {HTMLElement|null} */ (form.querySelector('input'))?.focus());
+  }
   return { el: wrap, title: 'Sign in' };
 }
 

@@ -1,13 +1,16 @@
 # go-bookshelf design
 
-Single Go binary + SQLite that serves a personal/family ebook and audiobook
+Single Go binary over SQLite or Postgres, serving a personal/family ebook and audiobook
 library through an installable PWA. Accessibility is an acceptance criterion:
 resizable text, adjustable spacing, high-contrast themes, large touch targets,
 keyboard-complete, screen-reader-clean markup.
 
 ## Principles
 
-- One static binary, one SQLite file, media mounted read-only.
+- One static binary, one database, media mounted read-only. The database is
+  SQLite by default and Postgres when the deployment has more than one node;
+  everything the server owns lives in it, so with Postgres there is no local
+  state at all and the process can be rescheduled anywhere.
 - Minimal dependency tree. Frontend is vanilla JavaScript ES modules + Web
   Components with no build step or Node toolchain, served straight from
   `embed.FS`. The only third-party frontend runtime dependency is the vendored
@@ -18,6 +21,10 @@ keyboard-complete, screen-reader-clean markup.
   EPUB content served from an isolated path into a sandboxed iframe under a
   strict CSP, archives extracted with size/entry/zip-slip guards.
 - No default credentials. First run prints a one-time setup token to the log.
+- Configuration is application data, not deployment plumbing. The environment
+  carries only what must be known before the database is open; everything else
+  is entered in the setup wizard or the admin settings page and stored in the
+  database, with credentials encrypted at rest.
 - Progress, bookmarks and reader/player preferences are stored per user on the
   server and follow the user across devices.
 
@@ -25,46 +32,123 @@ keyboard-complete, screen-reader-clean markup.
 
 ```
 cmd/go-bookshelf/        main: flags/env, wiring, serve
-internal/config/         env + yaml config (GOBOOKSHELF_* overrides)
-internal/store/          sqlite (modernc), embedded migrations, queries
+internal/config/         bootstrap only: listener, database selection, data dir, log level, secrets key
+internal/settings/       DB-backed application config, AES-GCM secrets, live reload
+internal/store/          the dialect seam (sqlite via modernc, postgres via pgx), embedded migrations
+internal/storetest/      throwaway test databases on either backend, imported only by tests
 internal/library/        scanner, file watcher, ingest pipeline
 internal/epub/           container.xml/OPF parse, cover, spine, safe zip reader
 internal/audio/          mp3 (ID3v2) + m4b/m4a (MP4 atoms, chpl/Nero chapters), duration
 internal/auth/           local users (argon2id), sessions, OIDC, proxy-header mode
 internal/api/            JSON handlers (/api/v1), OPDS (/opds), media streaming
-internal/server/         router, middleware (CSP, logging, auth, rate limit), static
+internal/server/         router, middleware (CSP, logging, auth, setup gate), static
+internal/oidctest/       a fake OpenID Connect provider, imported only by tests
 web/                     embed.go (`//go:embed all:dist`) + dist/ (index.html, app/, vendor/, icons/)
 docs/                    this file, API reference, deploy notes
 ```
 
 ## Config
 
-Env vars (yaml keys in parentheses):
+Configuration is split in two, by the only line that matters: whether the value
+has to be known before the database is open.
 
-| Var | Default | Purpose |
+### Bootstrap (environment, or the small YAML file)
+
+| Var (yaml key) | Default | Purpose |
 |---|---|---|
+| `GOBOOKSHELF_SECRETS_KEY` | **required** | base64, 32 bytes; AES-256 key for the secret settings values |
 | `GOBOOKSHELF_LISTEN` (`listen`) | `:8080` | bind address |
-| `GOBOOKSHELF_DB_PATH` (`db_path`) | `/data/go-bookshelf.db` | SQLite file |
-| `GOBOOKSHELF_DATA_DIR` (`data_dir`) | `/data` | covers cache, thumbnails |
-| `GOBOOKSHELF_BASE_URL` (`base_url`) | `http://localhost:8080` | external URL (OIDC redirect, OPDS links) |
-| `GOBOOKSHELF_LOG_LEVEL` | `info` | zerolog level |
-| `GOBOOKSHELF_OIDC_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` | unset | enables OIDC login when all set |
-| `GOBOOKSHELF_OIDC_ADMIN_GROUP` | unset | group claim that grants admin |
-| `GOBOOKSHELF_PROXY_AUTH_HEADER` | unset | e.g. `Remote-User`; only honored from `GOBOOKSHELF_TRUSTED_PROXIES` CIDRs |
-| `GOBOOKSHELF_TRUSTED_PROXIES` | unset | comma-separated CIDRs |
-| `GOBOOKSHELF_SECURE_COOKIES` | auto (true when base_url is https) | |
+| `GOBOOKSHELF_DB_DRIVER` (`db_driver`) | `sqlite` | `sqlite` or `postgres` |
+| `GOBOOKSHELF_DB_PATH` (`db_path`) | `/data/go-bookshelf.db` | SQLite file. Refused when the driver is `postgres` |
+| `GOBOOKSHELF_DB_DSN` (`db_dsn`) | unset | Postgres connection string. Required when the driver is `postgres`, refused otherwise. May carry a password, so it is only ever logged redacted |
+| `GOBOOKSHELF_DATA_DIR` (`data_dir`) | unset | Optional local cover cache. Empty means nothing is written to local disk |
+| `GOBOOKSHELF_LOG_LEVEL` (`log_level`) | `info` | zerolog level |
+| `GOBOOKSHELF_CONFIG` | unset | path to the YAML file holding the keys above |
+| `GOBOOKSHELF_ADMIN_RECOVERY` | `false` | force the password form on regardless of the stored settings |
+| `GOBOOKSHELF_DEV_INSECURE_KEY` | `false` | development only: derive a fixed secrets key and log a warning |
 
-Libraries (name, kind, paths) are created in the admin UI and stored in SQLite,
-not in config.
+A missing or wrong-length secrets key is fatal, with a message naming
+`openssl rand -base64 32`. Booting without it would look like an unconfigured
+server rather than a broken one, and any secret written under a wrong key is
+unrecoverable. YAML decoding is strict, so a file left over from an older
+release fails instead of being half-honored. The secrets key has no YAML key: it
+must not live in a file beside the database it decrypts.
 
-## Data model (SQLite)
+`GOBOOKSHELF_ADMIN_RECOVERY` is environment-only on purpose. Turning it on takes
+a restart, so an attacker who reaches the admin UI cannot re-enable the password
+path they would otherwise have to get past the identity provider for.
+
+### Application (database, edited in the app)
+
+One JSON document in `settings`, managed by `internal/settings`:
+
+```json
+{"general":  {"base_url":"", "secure_cookies":"auto|on|off",
+              "session_ttl":"720h", "scan_interval":"6h"},
+ "oidc":     {"enabled":false, "issuer":"", "client_id":"", "client_secret":"",
+              "admin_group":"", "user_group":"", "groups_claim":"groups",
+              "scopes":"", "auto_register":true, "local_login_enabled":true},
+ "proxy_auth":{"enabled":false, "header":"", "trusted_proxies":[]},
+ "metadata": {"provider":"none|openlibrary", "allow_private":false},
+ "metrics":  {"allow":["cidr"]},
+ "setup_complete": false, "updated_at": ""}
+```
+
+- **Secrets.** `oidc.client_secret` is AES-256-GCM encrypted inside the stored
+  JSON, with a fresh nonce per write, under `GOBOOKSHELF_SECRETS_KEY`. It is
+  decrypted once on load, kept in memory, and never returned by the API: reads
+  answer `has_client_secret`, and a write that sends an empty value keeps what
+  is stored. A decryption failure is an error, not an empty value, because
+  "someone changed the key" and "it was never set" need different answers.
+- **A save is validated, prepared, persisted, applied, in that order.**
+  Preparing is where anything that can fail against the outside world happens -
+  OIDC discovery above all - so an unreachable issuer is a 400 with the provider
+  error and nothing is stored or changed. Applying swaps a whole live snapshot
+  into the auth manager, so a request sees either the old configuration or the
+  new one, never a mixture. No restart.
+- **The issuer is stored verbatim** apart from surrounding whitespace. A token's
+  `iss` claim and the discovery document's own issuer field are compared against
+  it byte for byte, and some providers publish a trailing slash.
+- **Validation** rejects a base URL that is not absolute http(s), a session
+  lifetime under a minute, a scan interval that is negative or under a minute
+  (0 means "watcher only"), OIDC on without an issuer, client id and secret,
+  proxy authentication on without a header or without trusted CIDRs, an unknown
+  metadata provider, and any CIDR that does not parse. It also refuses to turn
+  the password form off while OIDC is off, because that would leave no way in.
+- **Setup gate.** While `setup_complete` is false the auth middleware answers
+  every `/api/v1` route except `/auth/*`, `/setup/*`, `/healthz`, `/readyz` and
+  `/admin/settings/oidc/test` with `403 setup_required`. The 401 check runs
+  first, so an anonymous caller still learns only that it must authenticate. A
+  database that already has accounts is seeded with `setup_complete: true`, so
+  an upgrade is not sent back through the wizard.
+
+Libraries (name, kind, paths) are created in the admin UI and stored in their
+own tables, not in this document.
+
+## Data model
+
+The schema is written twice, once per backend, under
+`internal/store/migrations/{sqlite,postgres}/`, with matching filenames. The
+alternative - one file plus a rewriter - was rejected because the DDL is exactly
+where the two engines differ most (identity columns, blob types, the order
+tables have to be created in), and a rewriter covering all of it would be the
+least reviewable code in the repository. What keeps the two sides honest is a
+test rather than a convention: `internal/store` checks that the directories hold
+the same steps and that neither has picked up the other's syntax.
+
+Everything below is dialect-neutral prose; the concrete types differ (`INTEGER
+PRIMARY KEY` against `BIGINT GENERATED BY DEFAULT AS IDENTITY`, `REAL` against
+`DOUBLE PRECISION`, `BLOB` against `BYTEA`). Timestamps are RFC3339 UTC strings
+written by the application on both, so the two schemas cannot drift on time
+formatting, and no column is a boolean - flags are 0/1 integers - so nothing
+depends on how a driver scans one.
 
 ```sql
 libraries(id, name, kind CHECK(kind IN ('ebook','audiobook','mixed')), created_at)
 library_paths(library_id, path, PRIMARY KEY(library_id, path))
 items(id, library_id, kind CHECK(kind IN ('ebook','audiobook')), title, sort_title,
       subtitle, description, language, published, isbn, asin, publisher,
-      cover_path, duration_ms, size_bytes, added_at, updated_at, missing_at)
+      has_cover, duration_ms, size_bytes, added_at, updated_at, missing_at)
 files(id, item_id, path UNIQUE, size, mtime, sha1, format, duration_ms, seq)
 chapters(file_id, seq, title, start_ms, end_ms, PRIMARY KEY(file_id, seq))
 people(id, name UNIQUE, sort_name)
@@ -80,10 +164,72 @@ user_settings(user_id PRIMARY KEY, reader_json, player_json, ui_json, updated_at
 progress(user_id, item_id, locator, position_ms, percent REAL, finished_at NULL,
          device, updated_at, PRIMARY KEY(user_id, item_id))
 bookmarks(id, user_id, item_id, locator, position_ms, note, created_at)
+settings(id CHECK(id = 1), data TEXT, updated_at)   -- one JSON document; secrets encrypted
 sessions(id, user_id, created_at, expires_at, user_agent, ip)
 api_tokens(id, user_id, name, token_hash, scopes, created_at, last_used_at)
 scan_runs(id, library_id, started_at, finished_at, added, updated, removed, errors)
+setup_state(id CHECK(id = 1), token_hash, created_at, used_at)  -- one-time first-run token
+progress_archive(user_id, library_id, source_key, locator, position_ms, percent,
+                 finished_at NULL, device, archived_at, PRIMARY KEY(user_id, library_id, source_key))
+cover_images(item_id, variant CHECK(variant IN ('thumb','full')), content_type,
+             bytes, updated_at, PRIMARY KEY(item_id, variant))
 ```
+
+Cover artwork is rows, not files. The scan that ingests a book re-encodes
+whatever artwork it carried into two bounded JPEGs - a thumbnail at most 400px
+on its longest side, a full render at most 1600px - and writes both, plus the
+`items.has_cover` flag, in one transaction, so an item never advertises a cover
+that only half exists. `GET /items/{id}/cover` reads them back. When
+`GOBOOKSHELF_DATA_DIR` is set the same bytes are mirrored into a write-through
+file cache under it and served from there on the next request; when it is not,
+they are served straight from the database and the process touches no local
+disk. The flag is a column rather than an `EXISTS` subquery so that listing a
+page of items still costs one row read and never a lookup into the artwork.
+
+### The dialect seam
+
+Feature packages write SQL once, with `?` placeholders, and `store.DB`/`store.Tx`
+rebind it (`?` to `$n`) before execution. Only three differences survive that
+far, and each is handled in one place:
+
+| Difference | Where it is handled |
+|---|---|
+| Placeholder style | `Dialect.Rebind`, applied by the `DB`/`Tx` wrappers |
+| Generated ids (`LastInsertId` has no Postgres equivalent) | `InsertReturningID`, which appends `RETURNING id` on Postgres |
+| Schema DDL: identity columns, `BLOB`/`BYTEA`, `REAL`/`DOUBLE PRECISION`, foreign keys needing their target to exist already | the per-dialect migration files |
+
+Everything else is avoided rather than translated, because a construct that is
+never written cannot be mistranslated:
+
+| Avoided | Written instead |
+|---|---|
+| `COLLATE NOCASE` (SQLite-only) | `lower(x)`, in `ORDER BY` and in the username lookup |
+| `LIKE` case-folding (insensitive on SQLite, sensitive on Postgres) | `lower(column) LIKE ?` with a lowered pattern |
+| `INSERT OR IGNORE` (SQLite-only) | `ON CONFLICT DO NOTHING`, which both accept |
+| `datetime('now')` (SQLite-only) | `store.Now()`, so both backends store the same format |
+| Untyped parameters in an `INSERT ... SELECT` projection, which Postgres cannot infer | explicit `CAST(? AS BIGINT/TEXT)`, which both accept |
+| Booleans | 0/1 integer columns |
+
+A test in `internal/store` walks the Go sources and fails on `COLLATE NOCASE`,
+`INSERT OR`, `datetime('now')`, `LastInsertId`, `PRAGMA` and `sqlite_master`
+reappearing outside this package, so those conventions are enforced rather than
+remembered. The rest - the folded `LIKE`, the casts, the absent booleans - are
+carried by the round-trip tests, which run against both backends.
+
+Connection handling differs by backend: SQLite gets WAL, `foreign_keys=ON` and a
+small pool; Postgres gets a bounded pool (16 open, 4 idle) with a 30-minute
+connection lifetime, so a rolling restart of the database is not felt as a wall
+of dead-connection errors.
+
+### Testing both backends
+
+`internal/storetest` hands every suite a throwaway database: SQLite by default,
+Postgres when `GOBOOKSHELF_TEST_POSTGRES_DSN` is set, each test getting a schema
+of its own. Nothing in the tests knows which one it got, so setting that one
+variable re-runs the entire suite - the API and frontend contract tests included
+- against the other backend. CI does exactly that in a second job with a
+`postgres:17` service, and `scripts/smoke.sh --driver postgres` drives the real
+binary against it with no data directory at all.
 
 `locator` is an EPUB CFI string for ebooks; `position_ms` is the absolute
 position across the concatenated file sequence for audiobooks.
@@ -115,18 +261,71 @@ List endpoints accept `?limit=&offset=&sort=&q=` and return
 `{"items":[...],"total":n}`.
 
 Auth
-- `GET /auth/status` (public) -> `{setup_required, oidc_enabled, oidc_start_url, version}`
-- `POST /auth/setup` `{token, username, password, display_name}` first-run admin
-- `POST /auth/login` `{username, password}` -> sets cookie, returns user
+- `GET /auth/status` (public) -> `{setup_required, setup_complete, oidc_enabled,
+  oidc_start_url, local_login, version}`
+- `POST /auth/login` `{username, password}` -> sets cookie, returns user.
+  403 when the password form is off and `GOBOOKSHELF_ADMIN_RECOVERY` is not set
 - `POST /auth/logout`
 - `GET /auth/oidc/start` -> 302; `GET /auth/oidc/callback`
 - `GET /auth/me` -> `{id, username, display_name, role, libraries:[ids], auth_method}`
 
 `/auth/me` is a pure "who am I": with no credential it answers 401 carrying
 nothing but the error envelope. Everything the signed-out login page needs -
-whether to offer SSO, whether to send the operator to `/setup` - comes from
-`/auth/status`, which is deliberately public and reveals only which login
-methods exist.
+whether to offer SSO, whether to show the password form, whether to send the
+operator to `/setup` - comes from `/auth/status`, which is deliberately public
+and reveals only which sign-in methods exist.
+
+First-run wizard (`POST /api/v1/setup/{step}`)
+
+One route per step rather than one endpoint with a step field, so a half-
+finished wizard is resumable from the steps' own status codes. Every step
+answers 409 once setup is complete.
+
+- `token` `{token}` -> `{ok, suggested_base_url}`. Checks the one-time token
+  without spending it, and suggests a base URL from `X-Forwarded-Proto` /
+  `X-Forwarded-Host`, falling back to `Host`. Public, rate limited.
+- `admin` `{token, username, password, display_name}` -> the user object, and
+  sets the session cookie. Spends the token. Public, rate limited.
+- `base-url` `{base_url}` -> `{base_url, redirect_url}`. Admin.
+- `oidc` `{skip}` or an OIDC document -> `{oidc_enabled}`. Admin.
+- `library` `{skip}` or `{name, kind, path}` -> the library. The path must
+  already exist and be a directory. Admin.
+- `complete` -> `{setup_complete: true}`. Admin. Opens the rest of the API.
+
+Settings (admin)
+
+- `GET|PUT /admin/settings` -> the document above, with `oidc.client_secret`
+  replaced by `has_client_secret`, plus `oidc.redirect_url` (derived),
+  `oidc.active` (discovery actually succeeded, as opposed to merely configured)
+  and `admin_recovery` (the environment flag, so the page can explain why the
+  password form is still on offer). PUT takes any subset: every section is
+  optional and an absent field keeps its stored value. An empty
+  `client_secret` keeps the stored one.
+- `POST /admin/settings/oidc/test` -> `{ok, issuer, redirect_url, groups_claim,
+  admin_group, user_group}` or `{ok:false, error}`. Runs discovery against a
+  candidate document and stores nothing. Answers 200 either way: the verdict is
+  the payload, not the status. Discovery proves the issuer answers and says
+  nothing about what a token will carry, which is why the group mapping is
+  echoed back for the operator to check against their provider.
+
+### OIDC group mapping
+
+Both group names are optional and both are matched against the claim named by
+`groups_claim` (default `groups`); the `groups` scope is added to the request
+automatically when either is set.
+
+| Admin group | User group | Outcome |
+|---|---|---|
+| member | any | role `admin` |
+| not a member | empty | role `user` - any authenticated identity is admitted |
+| not a member | member | role `user` |
+| not a member | not a member | refused, `ErrNotAuthorized`, no account created |
+
+The role is re-evaluated on every sign-in, so a directory change promotes or
+demotes. Two exceptions: an account with the `restricted` role is never
+rewritten, and an administrator who still has a local password is never demoted
+- that is the break-glass account, and losing it when the directory is what
+broke is the failure this whole feature has to survive.
 
 Libraries (admin for writes)
 - `GET /libraries`; `POST /libraries` `{name, kind, paths:[]}`; `PATCH /libraries/{id}`; `DELETE /libraries/{id}`
@@ -176,10 +375,11 @@ User state
 Admin
 - `GET|POST /users`, `PATCH /users/{id}`, `DELETE /users/{id}`, `PUT /users/{id}/libraries`
 - `GET /system/status` -> `{version, go_version, db_path, db_size_bytes, data_dir,
-  counts:{ebooks,audiobooks}, libraries, users, last_scans, oidc_enabled, time}`
+  counts:{ebooks,audiobooks}, libraries, users, last_scans, oidc_enabled,
+  local_login, settings_updated_at, base_url, time}`
 
 Other
-- `GET /healthz`, `GET /readyz`, `GET /metrics` (Prometheus; bind-limited by `GOBOOKSHELF_METRICS_ALLOW` CIDRs, default loopback + RFC1918)
+- `GET /healthz`, `GET /readyz`, `GET /metrics` (Prometheus; limited to the CIDRs in the stored `metrics.allow`, default loopback + RFC1918)
 - `GET /opds` OPDS 1.2 root, `/opds/{library}`, `/opds/search?q=`; Basic auth with api token
 - `GET /manifest.webmanifest`, `/sw.js`, `/assets/*`
 
@@ -256,6 +456,12 @@ scaling still compounds on top of it.
 | SSRF | cover/metadata fetch refuses non-http(s), loopback, link-local, RFC1918 unless allowlisted; disabled entirely when no provider enabled |
 | Proxy-header auth | header ignored from non-trusted source IP |
 | Rate limit | login and setup endpoints limited per IP |
+| Settings at rest | the OIDC client secret is ciphertext in the row, never returned by the API, and a wrong key fails loudly rather than reading as unset |
+| Setup gate | every `/api/v1` route except the wizard and the public probes answers 403 until setup completes; the 401 check still runs first |
+| Settings authorization | `GET`/`PUT /admin/settings` and the OIDC test are admin-only; a plain user gets 403, an anonymous caller 401 |
+| Lockout | the password form cannot be turned off while OIDC is off, nor while no administrator could sign in through it; `GOBOOKSHELF_ADMIN_RECOVERY` is environment-only |
+| SSO group mapping | an identity in neither configured group is refused and creates no account |
+| Setup token | spendable exactly once even under concurrent requests, so the wizard can only ever create one administrator; a rejected account hands the token back |
 
 ## Milestones
 

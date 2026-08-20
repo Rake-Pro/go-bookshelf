@@ -1,7 +1,10 @@
 package library_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"image"
 	"image/color"
 	"math"
 	"os"
@@ -13,6 +16,7 @@ import (
 	"github.com/rake-pro/go-bookshelf/internal/images"
 	"github.com/rake-pro/go-bookshelf/internal/library"
 	"github.com/rake-pro/go-bookshelf/internal/store"
+	"github.com/rake-pro/go-bookshelf/internal/storetest"
 )
 
 type env struct {
@@ -28,11 +32,7 @@ func newEnv(t *testing.T) *env {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	db, err := store.Open(ctx, filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t)
 
 	covers, err := images.NewStore(filepath.Join(dir, "covers"))
 	if err != nil {
@@ -466,5 +466,115 @@ func TestSettingsNormalizeClampsRanges(t *testing.T) {
 	if s.UI.TextScale != 1.2 || s.Reader.FontScale != 1.3 || s.Player.Speed != 1.35 {
 		t.Errorf("in-range step values were altered: ui=%v reader=%v player=%v",
 			s.UI.TextScale, s.Reader.FontScale, s.Player.Speed)
+	}
+}
+
+// Covers are stored in the database, in both bounded variants, and the local
+// cache is only a mirror. The same scan therefore has to work with no cache at
+// all - which is the configuration a deployment with no writable volume runs.
+func TestCoversAreStoredInTheDatabase(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		cacheDir string
+	}{
+		{"with a disk cache", "covers"},
+		{"with no disk cache", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			db := storetest.Open(t)
+			cacheDir := ""
+			if tc.cacheDir != "" {
+				cacheDir = filepath.Join(dir, tc.cacheDir)
+			}
+			covers, err := images.NewStore(cacheDir)
+			if err != nil {
+				t.Fatalf("cover store: %v", err)
+			}
+			cat := library.NewCatalog(db)
+			root := filepath.Join(dir, "media")
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			scanner := library.NewScanner(cat, covers)
+
+			if err := fixtures.WriteEPUB(filepath.Join(root, "afternoon.epub"), fixtures.EPUBOptions{
+				Title:   "The Long Afternoon",
+				Authors: []string{"A. Writer"},
+				// Deliberately larger than the thumbnail bound so the two
+				// variants cannot come out identical.
+				Cover: fixtures.PNG(900, 1200, color.RGBA{B: 200, A: 255}),
+			}); err != nil {
+				t.Fatalf("fixture: %v", err)
+			}
+			lib, err := cat.CreateLibrary(ctx, "Books", library.KindEbook, []string{root})
+			if err != nil {
+				t.Fatalf("create library: %v", err)
+			}
+			if _, err := scanner.ScanLibrary(ctx, lib.ID); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+
+			items, _, err := cat.ListItems(ctx, library.ListOptions{})
+			if err != nil || len(items) != 1 {
+				t.Fatalf("list: %v (%d items)", err, len(items))
+			}
+			itemID := items[0].ID
+			if items[0].CoverURL == "" {
+				t.Fatal("the item does not advertise a cover")
+			}
+
+			var thumb, full library.Cover
+			for _, variant := range []string{images.VariantThumb, images.VariantFull} {
+				cov, err := cat.Cover(ctx, itemID, variant)
+				if err != nil {
+					t.Fatalf("read %s cover: %v", variant, err)
+				}
+				if cov.ContentType != "image/jpeg" {
+					t.Errorf("%s content type = %q", variant, cov.ContentType)
+				}
+				cfg, format, err := image.DecodeConfig(bytes.NewReader(cov.Bytes))
+				if err != nil {
+					t.Fatalf("decode %s: %v", variant, err)
+				}
+				if format != "jpeg" {
+					t.Errorf("%s format = %q, want jpeg", variant, format)
+				}
+				bound := images.MaxDim(variant)
+				if cfg.Width > bound || cfg.Height > bound {
+					t.Errorf("%s is %dx%d, want neither side above %d", variant, cfg.Width, cfg.Height, bound)
+				}
+				if variant == images.VariantThumb {
+					thumb = cov
+				} else {
+					full = cov
+				}
+			}
+			if bytes.Equal(thumb.Bytes, full.Bytes) {
+				t.Error("both variants stored the same bytes")
+			}
+
+			// The cache mirrors the rows when it exists, and stays empty
+			// otherwise.
+			cached, _, ok := covers.Read(itemID, images.VariantThumb)
+			if tc.cacheDir == "" {
+				if ok {
+					t.Error("a disabled cache reported a hit")
+				}
+			} else {
+				if !ok {
+					t.Fatal("the cover was not mirrored into the cache")
+				}
+				if !bytes.Equal(cached, thumb.Bytes) {
+					t.Error("the cached thumbnail differs from the stored one")
+				}
+			}
+
+			// An item with no artwork reports not found rather than empty bytes.
+			if _, err := cat.Cover(ctx, itemID+999, images.VariantFull); !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("cover for an unknown item = %v, want ErrNotFound", err)
+			}
+		})
 	}
 }

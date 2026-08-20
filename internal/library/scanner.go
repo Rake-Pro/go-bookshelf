@@ -78,12 +78,9 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID int64) (ScanRun, er
 	}
 
 	run := ScanRun{LibraryID: libraryID, StartedAt: store.Now()}
-	res, err := s.cat.db.ExecContext(ctx,
+	run.ID, err = s.cat.db.InsertReturningID(ctx,
 		`INSERT INTO scan_runs (library_id, started_at) VALUES (?, ?)`, libraryID, run.StartedAt)
 	if err != nil {
-		return run, err
-	}
-	if run.ID, err = res.LastInsertId(); err != nil {
 		return run, err
 	}
 
@@ -285,7 +282,7 @@ func (s *Scanner) ingest(ctx context.Context, lib *Library, c candidate) (ingest
 			return statusUnchanged, err
 		}
 	} else {
-		res, err := tx.ExecContext(ctx,
+		itemID, err = tx.InsertReturningID(ctx,
 			`INSERT INTO items (library_id, kind, title, sort_title, subtitle, description, language,
 				published, isbn, asin, publisher, duration_ms, size_bytes, source_key, added_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -295,20 +292,13 @@ func (s *Scanner) ingest(ctx context.Context, lib *Library, c candidate) (ingest
 		if err != nil {
 			return statusUnchanged, err
 		}
-		if itemID, err = res.LastInsertId(); err != nil {
-			return statusUnchanged, err
-		}
 	}
 
 	for i, f := range meta.Files {
-		res, err := tx.ExecContext(ctx,
+		fileID, err := tx.InsertReturningID(ctx,
 			`INSERT INTO files (item_id, path, size, mtime, sha1, format, duration_ms, seq)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			itemID, f.Path, f.Size, f.MTime, f.SHA1, f.Format, f.DurationMS, i)
-		if err != nil {
-			return statusUnchanged, err
-		}
-		fileID, err := res.LastInsertId()
 		if err != nil {
 			return statusUnchanged, err
 		}
@@ -332,7 +322,7 @@ func (s *Scanner) ingest(ctx context.Context, lib *Library, c candidate) (ingest
 				return statusUnchanged, err
 			}
 			if _, err := tx.ExecContext(ctx,
-				`INSERT OR IGNORE INTO item_people (item_id, person_id, role, seq) VALUES (?, ?, ?, ?)`,
+				`INSERT INTO item_people (item_id, person_id, role, seq) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
 				itemID, personID, role, seq); err != nil {
 				return statusUnchanged, err
 			}
@@ -344,7 +334,7 @@ func (s *Scanner) ingest(ctx context.Context, lib *Library, c candidate) (ingest
 			return statusUnchanged, err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO item_series (item_id, series_id, sequence) VALUES (?, ?, ?)`,
+			`INSERT INTO item_series (item_id, series_id, sequence) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
 			itemID, seriesID, meta.SeriesIndex); err != nil {
 			return statusUnchanged, err
 		}
@@ -355,7 +345,7 @@ func (s *Scanner) ingest(ctx context.Context, lib *Library, c candidate) (ingest
 			return statusUnchanged, err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?, ?)`, itemID, tagID); err != nil {
+			`INSERT INTO item_tags (item_id, tag_id) VALUES (?, ?) ON CONFLICT DO NOTHING`, itemID, tagID); err != nil {
 			return statusUnchanged, err
 		}
 	}
@@ -364,7 +354,7 @@ func (s *Scanner) ingest(ctx context.Context, lib *Library, c candidate) (ingest
 		return statusUnchanged, err
 	}
 
-	if len(meta.Cover) > 0 && s.covers != nil {
+	if len(meta.Cover) > 0 {
 		if err := s.saveCover(ctx, itemID, meta.Cover); err != nil {
 			log.Warn().Err(err).Int64("item", itemID).Msg("cover extraction failed")
 		}
@@ -379,16 +369,22 @@ func (s *Scanner) ingest(ctx context.Context, lib *Library, c candidate) (ingest
 	return statusAdded, nil
 }
 
+// saveCover stores both rendered variants in the database, then mirrors them
+// into the local cache when one is configured. The cache is best-effort: a
+// failure to write it is logged, never returned, because the authoritative copy
+// is already committed.
 func (s *Scanner) saveCover(ctx context.Context, itemID int64, raw []byte) error {
-	full, err := s.covers.Save(ctx, itemID, "full", raw)
+	stored, err := s.cat.SaveCover(ctx, itemID, raw)
 	if err != nil {
 		return err
 	}
-	if _, err := s.covers.Save(ctx, itemID, "thumb", raw); err != nil {
-		return err
+	for _, cov := range stored {
+		if err := s.covers.Put(itemID, cov.Variant, cov.Bytes); err != nil {
+			log.Warn().Err(err).Int64("item", itemID).Str("variant", cov.Variant).
+				Msg("caching the cover on disk failed")
+		}
 	}
-	_, err = s.cat.db.ExecContext(ctx, `UPDATE items SET cover_path = ? WHERE id = ?`, full, itemID)
-	return err
+	return nil
 }
 
 // filesUnchanged reports whether the stored file rows match what is on disk.
@@ -471,7 +467,7 @@ func (s *Scanner) markMissing(ctx context.Context, libraryID int64, seen map[str
 	return removed, nil
 }
 
-func upsertNamed(ctx context.Context, tx *sql.Tx, table, name, sortValue string) (int64, error) {
+func upsertNamed(ctx context.Context, tx *store.Tx, table, name, sortValue string) (int64, error) {
 	// Only the three fixed catalog vocabularies reach this helper.
 	switch table {
 	case "people", "series", "tags":

@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"github.com/rake-pro/go-bookshelf/internal/config"
+	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
 	"golang.org/x/oauth2"
 )
@@ -27,42 +27,69 @@ var ErrOIDCDisabled = errors.New("auth: OIDC login is not enabled")
 // issued at the start of the flow.
 var ErrOIDCState = errors.New("auth: OIDC state mismatch")
 
+// ErrNoAccount is returned when a verified identity has no local account and
+// automatic registration is off.
+var ErrNoAccount = errors.New("auth: no account exists for this identity")
+
+// ErrNotAuthorized is returned when a verified identity is in neither of the
+// configured groups.
+var ErrNotAuthorized = errors.New("auth: this identity is not authorized for this application")
+
 type oidcClient struct {
-	verifier    *oidc.IDTokenVerifier
-	oauth       oauth2.Config
-	groupsClaim string
-	adminGroup  string
+	verifier     *oidc.IDTokenVerifier
+	oauth        oauth2.Config
+	groupsClaim  string
+	adminGroup   string
+	userGroup    string
+	autoRegister bool
 }
 
-func newOIDCClient(ctx context.Context, cfg config.Config) (*oidcClient, error) {
-	provider, err := oidc.NewProvider(ctx, cfg.OIDC.Issuer)
+// newOIDCClient runs discovery against the stored issuer and builds the
+// verifier and OAuth client from it. Every caller reaches it through
+// Manager.Prepare, so a failure here is what turns a bad issuer into a rejected
+// settings save rather than a broken sign-in later.
+func newOIDCClient(ctx context.Context, s settings.Settings) (*oidcClient, error) {
+	provider, err := oidc.NewProvider(ctx, s.OIDC.Issuer)
 	if err != nil {
 		return nil, fmt.Errorf("oidc discovery: %w", err)
 	}
 	scopes := []string{oidc.ScopeOpenID, "profile", "email"}
-	if cfg.OIDC.Scopes != "" {
-		scopes = strings.FieldsFunc(cfg.OIDC.Scopes, func(r rune) bool { return r == ',' || r == ' ' })
+	if s.OIDC.Scopes != "" {
+		scopes = strings.FieldsFunc(s.OIDC.Scopes, func(r rune) bool { return r == ',' || r == ' ' })
 	}
-	if cfg.OIDC.AdminGroup != "" {
+	// Either group mapping needs the claim to actually arrive, and most
+	// providers only send it when the scope is asked for.
+	if s.OIDC.AdminGroup != "" || s.OIDC.UserGroup != "" {
 		scopes = appendUnique(scopes, "groups")
 	}
 	return &oidcClient{
-		verifier: provider.Verifier(&oidc.Config{ClientID: cfg.OIDC.ClientID}),
+		verifier: provider.Verifier(&oidc.Config{ClientID: s.OIDC.ClientID}),
 		oauth: oauth2.Config{
-			ClientID:     cfg.OIDC.ClientID,
-			ClientSecret: cfg.OIDC.ClientSecret,
+			ClientID:     s.OIDC.ClientID,
+			ClientSecret: s.OIDC.ClientSecret,
 			Endpoint:     provider.Endpoint(),
-			RedirectURL:  cfg.OIDCRedirectURL(),
+			RedirectURL:  s.OIDCRedirectURL(),
 			Scopes:       scopes,
 		},
-		groupsClaim: cfg.GroupsClaim(),
-		adminGroup:  cfg.OIDC.AdminGroup,
+		groupsClaim:  s.OIDC.GroupsClaim,
+		adminGroup:   s.OIDC.AdminGroup,
+		userGroup:    s.OIDC.UserGroup,
+		autoRegister: s.OIDC.AutoRegister,
 	}, nil
+}
+
+// Discover probes an issuer without touching the running configuration. It
+// backs the admin page's "Test" button, so an operator finds out that a URL is
+// wrong before saving it rather than after being locked out by it.
+func Discover(ctx context.Context, s settings.Settings) error {
+	_, err := newOIDCClient(ctx, s)
+	return err
 }
 
 // StartOIDC sets the state cookie and returns the provider URL to redirect to.
 func (m *Manager) StartOIDC(w http.ResponseWriter) (string, error) {
-	if m.oidc == nil {
+	cur := m.snapshot()
+	if cur.oidc == nil {
 		return "", ErrOIDCDisabled
 	}
 	state, err := randomHex(16)
@@ -78,17 +105,18 @@ func (m *Manager) StartOIDC(w http.ResponseWriter) (string, error) {
 		Value:    state + ":" + nonce,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   m.cfg.SecureCookies,
+		Secure:   cur.secureCookies,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   600,
 	})
-	return m.oidc.oauth.AuthCodeURL(state, oidc.Nonce(nonce)), nil
+	return cur.oidc.oauth.AuthCodeURL(state, oidc.Nonce(nonce)), nil
 }
 
 // CompleteOIDC validates the callback, maps the claims onto a local account,
 // and returns the user with a fresh session id.
 func (m *Manager) CompleteOIDC(ctx context.Context, w http.ResponseWriter, r *http.Request) (*User, string, error) {
-	if m.oidc == nil {
+	client := m.snapshot().oidc
+	if client == nil {
 		return nil, "", ErrOIDCDisabled
 	}
 	cookie, err := r.Cookie(oidcStateCookie)
@@ -107,7 +135,7 @@ func (m *Manager) CompleteOIDC(ctx context.Context, w http.ResponseWriter, r *ht
 		return nil, "", fmt.Errorf("auth: OIDC callback without a code")
 	}
 
-	tok, err := m.oidc.oauth.Exchange(ctx, code)
+	tok, err := client.oauth.Exchange(ctx, code)
 	if err != nil {
 		return nil, "", fmt.Errorf("auth: OIDC token exchange: %w", err)
 	}
@@ -115,7 +143,7 @@ func (m *Manager) CompleteOIDC(ctx context.Context, w http.ResponseWriter, r *ht
 	if !ok {
 		return nil, "", errors.New("auth: OIDC response had no id_token")
 	}
-	idToken, err := m.oidc.verifier.Verify(ctx, rawID)
+	idToken, err := client.verifier.Verify(ctx, rawID)
 	if err != nil {
 		return nil, "", fmt.Errorf("auth: id_token verification: %w", err)
 	}
@@ -132,12 +160,14 @@ func (m *Manager) CompleteOIDC(ctx context.Context, w http.ResponseWriter, r *ht
 		return nil, "", errors.New("auth: OIDC claims carried no usable username")
 	}
 	displayName := firstString(claims, "name", "preferred_username")
-	role := RoleUser
-	if m.oidc.adminGroup != "" && hasGroup(claims[m.oidc.groupsClaim], m.oidc.adminGroup) {
-		role = RoleAdmin
+	role, ok := client.roleFor(claims)
+	if !ok {
+		// Refused before any account exists for the identity: a directory this
+		// server does not serve must not accumulate rows in its users table.
+		return nil, "", ErrNotAuthorized
 	}
 
-	u, err := m.userForSubject(ctx, idToken.Subject, username, displayName, role)
+	u, err := m.userForSubject(ctx, client, idToken.Subject, username, displayName, role)
 	if err != nil {
 		return nil, "", err
 	}
@@ -151,13 +181,28 @@ func (m *Manager) CompleteOIDC(ctx context.Context, w http.ResponseWriter, r *ht
 	return u, sid, nil
 }
 
+// roleFor maps the token's group claim onto a role. The second return is
+// whether the identity may sign in at all: with a user group configured,
+// membership of one of the two groups is the entry requirement, and without
+// one any authenticated identity is an ordinary user.
+func (c *oidcClient) roleFor(claims map[string]any) (string, bool) {
+	groups := claims[c.groupsClaim]
+	if c.adminGroup != "" && hasGroup(groups, c.adminGroup) {
+		return RoleAdmin, true
+	}
+	if c.userGroup != "" && !hasGroup(groups, c.userGroup) {
+		return "", false
+	}
+	return RoleUser, true
+}
+
 // userForSubject finds the account bound to an OIDC subject, linking or
 // creating one as needed.
-func (m *Manager) userForSubject(ctx context.Context, subject, username, displayName, role string) (*User, error) {
+func (m *Manager) userForSubject(ctx context.Context, client *oidcClient, subject, username, displayName, role string) (*User, error) {
 	row := m.db.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users WHERE oidc_subject = ?`, subject)
 	u, err := scanUser(row)
 	if err == nil {
-		if m.oidc.adminGroup != "" && u.Role != role && u.Role != RoleRestricted {
+		if client.shouldApplyRole(u, role) {
 			if err := m.SetRole(ctx, u.ID, role); err != nil {
 				return nil, err
 			}
@@ -183,6 +228,13 @@ func (m *Manager) userForSubject(ctx context.Context, subject, username, display
 		return nil, err
 	}
 
+	// With automatic registration off, an identity the provider vouches for is
+	// still refused unless an account was created for it first. That is the
+	// difference between "anyone in the directory may read the library" and
+	// "these people may".
+	if !client.autoRegister {
+		return nil, ErrNoAccount
+	}
 	created, err := m.CreateUser(ctx, username, "", displayName, role)
 	if err != nil {
 		return nil, err
@@ -233,4 +285,26 @@ func appendUnique(list []string, v string) []string {
 		}
 	}
 	return append(list, v)
+}
+
+// shouldApplyRole decides whether a sign-in may rewrite an existing account's
+// role. Group membership is re-evaluated on every sign-in, so a promotion or a
+// demotion at the provider follows the user here - with two exceptions.
+//
+// A restricted account is never touched: that role is a local decision the
+// directory knows nothing about. Neither is an administrator who still has a
+// local password: that is the break-glass account, and letting a directory
+// change demote it would remove the only way back in the moment the directory
+// is what went wrong.
+func (c *oidcClient) shouldApplyRole(u *User, role string) bool {
+	if c.adminGroup == "" && c.userGroup == "" {
+		return false
+	}
+	if u.Role == role || u.Role == RoleRestricted {
+		return false
+	}
+	if u.Role == RoleAdmin && role != RoleAdmin && u.HasPassword {
+		return false
+	}
+	return true
 }

@@ -4,7 +4,7 @@
  */
 
 import { router, navigate } from './router.js';
-import { setUnauthorizedHandler, probeAuth } from './api.js';
+import { setUnauthorizedHandler, setSetupRequiredHandler, probeAuth } from './api.js';
 import { store } from './store.js';
 import { createShell } from './components/app-shell.js';
 import { loadingView, errorView } from './components/states.js';
@@ -24,6 +24,7 @@ router
   .add('/search', () => import('./views/search.js'))
   .add('/settings', () => import('./views/settings.js'))
   .add('/admin', () => import('./views/admin.js'))
+  .add('/admin/settings', () => import('./views/admin-settings.js'))
   .add('/admin/:section', () => import('./views/admin.js'))
   .add('/login', () => import('./views/login.js'), { chrome: false })
   .add('/setup', () => import('./views/setup.js'), { chrome: false });
@@ -38,6 +39,11 @@ setUnauthorizedHandler((from) => {
   if (PUBLIC.has(location.pathname)) return;
   const next = from && from !== '/' ? `?next=${encodeURIComponent(from)}` : '';
   navigate('/login' + next, { replace: true });
+});
+
+/* An unfinished wizard closes every other route, so send the operator to it. */
+setSetupRequiredHandler(() => {
+  if (location.pathname !== '/setup') navigate('/setup', { replace: true });
 });
 
 /** @type {boolean} */

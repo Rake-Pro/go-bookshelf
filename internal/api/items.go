@@ -2,17 +2,20 @@ package api
 
 import (
 	"archive/zip"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rake-pro/go-bookshelf/internal/auth"
 	"github.com/rake-pro/go-bookshelf/internal/epub"
+	"github.com/rake-pro/go-bookshelf/internal/images"
 	"github.com/rake-pro/go-bookshelf/internal/library"
 	"github.com/rake-pro/go-bookshelf/internal/store"
 	"github.com/rs/zerolog/log"
@@ -141,26 +144,45 @@ func (a *API) itemCover(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, codeNotFound, "not found")
 		return
 	}
-	size := "full"
-	if r.URL.Query().Get("size") == "thumb" {
-		size = "thumb"
+	variant := images.Variant(r.URL.Query().Get("size"))
+
+	// The cache, when there is one, answers first. It holds exactly the bytes
+	// the database holds, written at the same moment, so a hit needs no
+	// round-trip.
+	if data, mod, ok := a.covers.Read(itemID, variant); ok {
+		serveCover(w, r, itemID, variant, "image/jpeg", data, mod)
+		return
 	}
-	path := a.covers.Path(itemID, size)
-	f, err := os.Open(path)
-	if err != nil {
+
+	cover, err := a.cat.Cover(r.Context(), itemID, variant)
+	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, codeNotFound, "no cover for this item")
 		return
 	}
-	defer f.Close()
-	info, err := f.Stat()
 	if err != nil {
 		fail(w, err, "cover")
 		return
 	}
-	w.Header().Set("Content-Type", "image/jpeg")
+	// Write-through: the next request for this cover is served from disk.
+	if err := a.covers.Put(itemID, variant, cover.Bytes); err != nil {
+		log.Warn().Err(err).Int64("item", itemID).Msg("caching the cover on disk failed")
+	}
+	serveCover(w, r, itemID, variant, cover.ContentType, cover.Bytes, cover.UpdatedAt)
+}
+
+// serveCover writes one cover with the caching headers a browser needs to stop
+// asking for it. The validator is derived from the bytes rather than from a
+// file's metadata, so it is the same whether the response came from the cache
+// or from the database.
+func serveCover(w http.ResponseWriter, r *http.Request, itemID int64, variant, contentType string,
+	data []byte, modTime time.Time) {
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "private, max-age=604800")
-	w.Header().Set("ETag", fmt.Sprintf(`"%d-%d-%s"`, itemID, info.Size(), size))
-	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), f)
+	w.Header().Set("ETag", fmt.Sprintf(`"%d-%d-%s"`, itemID, len(data), variant))
+	http.ServeContent(w, r, strconv.FormatInt(itemID, 10)+"-"+variant+".jpg", modTime, bytes.NewReader(data))
 }
 
 // epubManifest describes an EPUB well enough for a client to open it without

@@ -16,7 +16,7 @@ func TestSPAFallback(t *testing.T) {
 	shellRoutes := []string{
 		"/", "/library", "/library/12", "/item/7", "/read/7", "/listen/7",
 		"/authors", "/authors/3", "/series", "/series/3", "/search?q=hello",
-		"/settings", "/admin", "/admin/users", "/login?next=%2Fitem%2F7",
+		"/settings", "/admin", "/admin/settings", "/admin/users", "/login?next=%2Fitem%2F7",
 		"/setup", "/no/such/route",
 	}
 	for _, route := range shellRoutes {
@@ -89,12 +89,17 @@ func TestFrontendContract(t *testing.T) {
 	}
 	var status struct {
 		SetupRequired bool   `json:"setup_required"`
+		SetupComplete bool   `json:"setup_complete"`
 		OIDCEnabled   bool   `json:"oidc_enabled"`
 		OIDCStartURL  string `json:"oidc_start_url"`
+		LocalLogin    bool   `json:"local_login"`
 	}
 	decode(t, rec, &status)
-	if !status.SetupRequired {
-		t.Error("auth status before setup must report setup_required")
+	if !status.SetupRequired || status.SetupComplete {
+		t.Error("auth status before setup must report setup_required and not setup_complete")
+	}
+	if !status.LocalLogin {
+		t.Error("the password form must be offered before anything has been configured")
 	}
 	if status.OIDCEnabled {
 		t.Error("auth status reports OIDC without any OIDC configuration")
@@ -113,7 +118,7 @@ func TestFrontendContract(t *testing.T) {
 	if _, ok := meBody["error"]; !ok {
 		t.Errorf("401 /auth/me body = %s, want an error envelope", me.Body.String())
 	}
-	for _, leaked := range []string{"oidc", "setup_required"} {
+	for _, leaked := range []string{"oidc", "setup_required", "setup_complete", "local_login"} {
 		if _, ok := meBody[leaked]; ok {
 			t.Errorf("/auth/me 401 body carries %q; that belongs to /auth/status", leaked)
 		}
@@ -125,8 +130,8 @@ func TestFrontendContract(t *testing.T) {
 
 	after := h.do(http.MethodGet, "/api/v1/auth/status", nil)
 	decode(t, after, &status)
-	if status.SetupRequired {
-		t.Error("auth status still reports setup_required after setup")
+	if status.SetupRequired || !status.SetupComplete {
+		t.Error("auth status still reports setup as pending after the wizard finished")
 	}
 
 	login := h.do(http.MethodPost, "/api/v1/auth/login", map[string]string{
@@ -717,5 +722,61 @@ func TestFrontendContract(t *testing.T) {
 	}
 	if probe := h.do(http.MethodGet, "/api/v1/auth/me", nil, withCookie(sid)); probe.Code != http.StatusUnauthorized {
 		t.Errorf("GET /auth/me after logout = %d, want 401", probe.Code)
+	}
+}
+
+// The admin settings page reads and writes one document; this pins the exact
+// field names it depends on, because a rename here silently empties a form.
+func TestFrontendAdminSettingsContract(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+
+	rec := h.do(http.MethodGet, "/api/v1/admin/settings", nil, withCookie(sid))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin settings = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	decode(t, rec, &body)
+
+	for _, section := range []string{"general", "oidc", "proxy_auth", "metadata", "metrics"} {
+		if _, ok := body[section]; !ok {
+			t.Errorf("admin settings is missing the %q section: %s", section, rec.Body.String())
+		}
+	}
+	general, _ := body["general"].(map[string]any)
+	for _, key := range []string{"base_url", "secure_cookies", "session_ttl", "scan_interval"} {
+		if _, ok := general[key]; !ok {
+			t.Errorf("general is missing %q", key)
+		}
+	}
+	oidc, _ := body["oidc"].(map[string]any)
+	for _, key := range []string{
+		"enabled", "issuer", "client_id", "has_client_secret", "admin_group", "user_group",
+		"groups_claim", "scopes", "auto_register", "local_login_enabled", "redirect_url", "active",
+	} {
+		if _, ok := oidc[key]; !ok {
+			t.Errorf("oidc is missing %q", key)
+		}
+	}
+	if _, ok := oidc["client_secret"]; ok {
+		t.Error("the OIDC section carries client_secret; the secret must never be readable")
+	}
+	if _, ok := body["updated_at"]; !ok {
+		t.Error("admin settings is missing updated_at")
+	}
+
+	// The redirect URI the operator has to register is derived from the base
+	// URL, and the page shows it verbatim.
+	if oidc["redirect_url"] != "http://localhost:8080/api/v1/auth/oidc/callback" {
+		t.Errorf("redirect_url = %v", oidc["redirect_url"])
+	}
+
+	status := h.do(http.MethodGet, "/api/v1/system/status", nil, withCookie(sid))
+	var sys map[string]any
+	decode(t, status, &sys)
+	for _, key := range []string{"oidc_enabled", "settings_updated_at", "local_login"} {
+		if _, ok := sys[key]; !ok {
+			t.Errorf("system status is missing %q: %s", key, status.Body.String())
+		}
 	}
 }

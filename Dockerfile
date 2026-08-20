@@ -19,9 +19,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/go-bookshelf ./cmd/go-bookshelf
 
-# The database, cover cache and thumbnails live in /data, pre-created and owned
+# The SQLite database and the cover cache live in /data, pre-created and owned
 # by the distroless nonroot user (65532:65532) since the final image has no
-# shell to mkdir or chown at runtime.
+# shell to mkdir or chown at runtime. A Postgres deployment never touches it.
 RUN mkdir -p /out/data && chown 65532:65532 /out/data
 
 # ---- runtime ----
@@ -33,9 +33,30 @@ COPY --from=build /out/go-bookshelf /usr/local/bin/go-bookshelf
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build --chown=65532:65532 /out/data /data
 
-ENV GOBOOKSHELF_DB_PATH=/data/go-bookshelf.db \
+# The database path and data directory are the only settings baked in, and they
+# describe the default single-box deployment: SQLite in /data. Every other
+# application setting is entered in the app at /setup and stored in the database
+# - except GOBOOKSHELF_SECRETS_KEY, which encrypts those stored credentials and
+# must be supplied at run time:
+#
+#   docker run -e GOBOOKSHELF_SECRETS_KEY="$(openssl rand -base64 32)" ...
+#
+# There is deliberately no default: a baked-in key would be the same on every
+# installation of this image.
+#
+# To run on Postgres instead, clear both of these and supply a DSN. Nothing is
+# then written to local disk - cover images included - so the volume below goes
+# unused and the container can be rescheduled onto any node:
+#
+#   docker run \
+#     -e GOBOOKSHELF_DB_DRIVER=postgres \
+#     -e GOBOOKSHELF_DB_DSN="postgres://bookshelf:PASSWORD@db.example.com:5432/bookshelf?sslmode=require" \
+#     -e GOBOOKSHELF_DB_PATH= -e GOBOOKSHELF_DATA_DIR= ...
+ENV GOBOOKSHELF_DB_DRIVER=sqlite \
+    GOBOOKSHELF_DB_PATH=/data/go-bookshelf.db \
     GOBOOKSHELF_DATA_DIR=/data
 
+# Kept for SQLite installations. A Postgres one leaves it empty.
 VOLUME ["/data"]
 EXPOSE 8080
 USER nonroot:nonroot

@@ -34,6 +34,15 @@ let onUnauthorized = () => {};
 export function setUnauthorizedHandler(fn) { onUnauthorized = fn; }
 
 /**
+ * Called when the server answers 403 setup_required: the first-run wizard has
+ * not been finished, so every ordinary route is closed and the only useful
+ * place to be is /setup.
+ */
+let onSetupRequired = () => {};
+/** @param {()=>void} fn */
+export function setSetupRequiredHandler(fn) { onSetupRequired = fn; }
+
+/**
  * @param {string} path path under /api/v1, e.g. "/items?limit=20"
  * @param {RequestInit & {skipAuthRedirect?:boolean}} [opts]
  * @returns {Promise<any>}
@@ -60,6 +69,7 @@ export async function request(path, opts = {}) {
   if (!res.ok) {
     const err = body && typeof body === 'object' ? body.error : null;
     if (res.status === 401 && !skipAuthRedirect) onUnauthorized(location.pathname + location.search);
+    if (res.status === 403 && err?.code === 'setup_required') onSetupRequired();
     throw new ApiError(res.status, err?.code || String(res.status), err?.message || '', body);
   }
   return body;
@@ -98,20 +108,21 @@ export function qs(params) {
  * Auth probe, in two steps:
  *
  *   GET /api/v1/auth/me      200 -> the user; 401 -> nobody is signed in
- *   GET /api/v1/auth/status  200 -> {setup_required, oidc_enabled, oidc_start_url}
+ *   GET /api/v1/auth/status  200 -> {setup_required, setup_complete,
+ *                                    oidc_enabled, oidc_start_url, local_login}
  *
  * `/auth/me` stays a pure "who am I": its 401 body carries only the standard
  * error envelope. Everything the signed-out login page needs comes from the
  * public `/auth/status` endpoint, which is queried only when there is no
- * session. Both flags default to false if the call fails, so a probe error
- * degrades to password-only login instead of breaking the page.
+ * session. The flags fall back to "password login, setup done" if the call
+ * fails, so a probe error degrades to a usable form instead of a blank page.
  *
- * @returns {Promise<{user:any|null, oidc:boolean, setupRequired:boolean}>}
+ * @returns {Promise<{user:any|null, oidc:boolean, setupRequired:boolean, localLogin:boolean}>}
  */
 export async function probeAuth() {
   try {
     const user = await request('/auth/me', { skipAuthRedirect: true });
-    return { user, oidc: false, setupRequired: false };
+    return { user, oidc: false, setupRequired: false, localLogin: true };
   } catch (e) {
     if (!(e instanceof ApiError) || e.status !== 401) throw e;
   }
@@ -120,6 +131,8 @@ export async function probeAuth() {
     user: null,
     oidc: status.oidc_enabled === true,
     setupRequired: status.setup_required === true,
+    // Absent means an older backend that has no such switch, so the form stays.
+    localLogin: status.local_login !== false,
   };
 }
 
@@ -127,8 +140,9 @@ export async function probeAuth() {
  * Public login capabilities. Never rejects: an unreachable server yields an
  * empty object and the caller falls back to password login.
  *
- * @returns {Promise<{setup_required?:boolean, oidc_enabled?:boolean,
- *                    oidc_start_url?:string, version?:string}>}
+ * @returns {Promise<{setup_required?:boolean, setup_complete?:boolean,
+ *                    oidc_enabled?:boolean, oidc_start_url?:string,
+ *                    local_login?:boolean, version?:string}>}
  */
 export async function authStatus() {
   try {
@@ -143,9 +157,40 @@ export const auth = {
   login: (username, password) =>
     send('/auth/login', { username, password }),
   logout: () => request('/auth/logout', { method: 'POST', skipAuthRedirect: true }),
-  /** @param {{token:string,username:string,password:string,display_name:string}} data */
-  setup: (data) => send('/auth/setup', data),
   oidcStartUrl: () => `${BASE}/auth/oidc/start`,
+};
+
+/* ---------------- first-run wizard ---------------- */
+
+/**
+ * One call per step of `POST /api/v1/setup/{step}`. The first two run before
+ * anybody is signed in, so they opt out of the 401 redirect; the rest run as
+ * the administrator the second step created.
+ */
+export const setup = {
+  /** @param {string} token @returns {Promise<{ok:boolean, suggested_base_url:string}>} */
+  checkToken: (token) =>
+    request('/setup/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+      skipAuthRedirect: true,
+    }),
+  /** @param {{token:string,username:string,password:string,display_name:string}} data */
+  createAdmin: (data) =>
+    request('/setup/admin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+      skipAuthRedirect: true,
+    }),
+  /** @param {string} baseUrl @returns {Promise<{base_url:string, redirect_url:string}>} */
+  baseUrl: (baseUrl) => send('/setup/base-url', { base_url: baseUrl }),
+  /** @param {object} data an OIDC document, or `{skip:true}` */
+  oidc: (data) => send('/setup/oidc', data),
+  /** @param {object} data `{name, kind, path}`, or `{skip:true}` */
+  library: (data) => send('/setup/library', data),
+  complete: () => send('/setup/complete', {}),
 };
 
 /* ---------------- catalog ---------------- */
@@ -184,6 +229,13 @@ export const api = {
     send(`/users/${encodeURIComponent(id)}/libraries`, { libraries: libraryIds }, 'PUT'),
 
   systemStatus: () => request('/system/status'),
+
+  /** Admin-only application settings; the OIDC client secret is never returned. */
+  adminSettings: () => request('/admin/settings'),
+  /** @param {object} patch every section is optional */
+  putAdminSettings: (patch) => send('/admin/settings', patch, 'PUT'),
+  /** @param {object} data a candidate OIDC document @returns {Promise<{ok:boolean, error?:string}>} */
+  testOidc: (data) => send('/admin/settings/oidc/test', data),
 
   settings: () => request('/me/settings'),
   /** @param {{reader?:object,player?:object,ui?:object}} s */

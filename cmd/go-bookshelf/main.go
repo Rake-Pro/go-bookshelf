@@ -1,6 +1,6 @@
 // Command go-bookshelf serves a personal ebook and audiobook library from a
-// single binary: SQLite for the catalog, media mounted read-only, and the
-// frontend embedded in the executable.
+// single binary: SQLite or Postgres for the catalog, media mounted read-only,
+// and the frontend embedded in the executable.
 package main
 
 import (
@@ -21,6 +21,7 @@ import (
 	"github.com/rake-pro/go-bookshelf/internal/images"
 	"github.com/rake-pro/go-bookshelf/internal/library"
 	"github.com/rake-pro/go-bookshelf/internal/server"
+	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
 	"github.com/rake-pro/go-bookshelf/web"
 	"github.com/rs/zerolog"
@@ -46,6 +47,11 @@ func main() {
 		boot.Fatal().Err(err).Msg("load config")
 	}
 	initLogger(cfg.LogLevel)
+	if cfg.InsecureKey {
+		log.Warn().Msg("GOBOOKSHELF_DEV_INSECURE_KEY is set: stored secrets are encrypted with a " +
+			"key derived from a published constant. Never use this outside local development. " +
+			"Generate a real key with: openssl rand -base64 32")
+	}
 
 	if err := run(cfg); err != nil {
 		log.Fatal().Err(err).Msg("go-bookshelf exited with error")
@@ -58,25 +64,50 @@ func run(cfg config.Config) error {
 
 	log.Info().Str("version", version).Str("listen", cfg.Listen).Msg("go-bookshelf starting")
 
-	db, err := store.Open(ctx, cfg.DBPath)
+	db, err := store.Open(ctx, cfg.DBDriver, cfg.DSN())
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	log.Info().Str("path", cfg.DBPath).Msg("database ready")
+	// SafeDSN, not the DSN: a Postgres connection string carries a password.
+	log.Info().Str("driver", cfg.DBDriver).Str("database", cfg.SafeDSN()).Msg("database ready")
 
+	// With no data directory the cover cache is off and the process writes
+	// nothing to local disk, which is what lets it be rescheduled anywhere.
 	covers, err := images.NewStore(cfg.CoversDir())
 	if err != nil {
 		return err
 	}
+	if covers.Enabled() {
+		log.Info().Str("dir", covers.Dir()).Msg("caching covers on local disk")
+	} else {
+		log.Info().Msg("no data directory configured; covers are served from the database")
+	}
 
-	// OIDC discovery talks to the provider, so bound it.
-	authCtx, authCancel := context.WithTimeout(ctx, 20*time.Second)
-	authMgr, err := auth.New(authCtx, db, cfg)
-	authCancel()
+	authMgr := auth.New(db, cfg)
+
+	// A database that already has accounts predates the setup wizard, so it
+	// starts with setup marked complete rather than locking its owner out of
+	// their own server on upgrade.
+	users, err := authMgr.UserCount(ctx)
 	if err != nil {
 		return err
 	}
+	set, err := settings.New(ctx, db, cfg.SecretsKey, users > 0)
+	if err != nil {
+		return err
+	}
+	set.Register(authMgr)
+
+	// Applying the stored settings talks to the identity provider, so bound it.
+	// A provider that is briefly unreachable must not stop the server from
+	// serving local sign-ins: the failure is logged and everything else applies.
+	applyCtx, applyCancel := context.WithTimeout(ctx, 20*time.Second)
+	if err := set.Apply(applyCtx); err != nil {
+		log.Error().Err(err).Msg("OIDC discovery failed; OIDC sign-in is off until it succeeds")
+	}
+	applyCancel()
+
 	if err := authMgr.PruneSessions(ctx); err != nil {
 		log.Warn().Err(err).Msg("pruning expired sessions failed")
 	}
@@ -89,7 +120,8 @@ func run(cfg config.Config) error {
 		return err
 	}
 	if token != "" {
-		log.Warn().Msgf("FIRST-RUN SETUP: no account exists yet. Open %s/setup and enter this one-time token: %s", cfg.BaseURL, token)
+		log.Warn().Msgf("FIRST-RUN SETUP: no account exists yet. Open %s/setup and enter this one-time token: %s",
+			set.Get().General.BaseURL, token)
 	}
 
 	cat := library.NewCatalog(db)
@@ -100,14 +132,14 @@ func run(cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	handler := server.New(cfg, api.New(cfg, db, cat, authMgr, scanner, covers, version), authMgr, dist)
+	handler := server.New(api.New(cfg, set, db, cat, authMgr, scanner, covers, version), authMgr, set, dist)
 
 	watcher := library.NewWatcher(cat, scanner, library.DefaultDebounce)
 	if err := watcher.Start(ctx); err != nil {
 		log.Warn().Err(err).Msg("filesystem watching is unavailable; scans will run on the timer only")
 	}
 	go janitor.Start(ctx, 6*time.Hour)
-	go periodicScan(ctx, scanner, cfg.ScanInterval)
+	go periodicScan(ctx, scanner, set)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -148,25 +180,34 @@ func run(cfg config.Config) error {
 
 // periodicScan rescans every library on a timer, catching changes that the
 // filesystem watcher missed (network shares often emit no events at all).
-func periodicScan(ctx context.Context, scanner *library.Scanner, every time.Duration) {
-	if every <= 0 {
-		return
-	}
+//
+// The interval is read from the settings before every wait rather than captured
+// once, so changing it on the admin page takes effect from the next cycle
+// instead of the next restart. An interval of zero turns the timer off and
+// leaves the watcher as the only trigger.
+func periodicScan(ctx context.Context, scanner *library.Scanner, set *settings.Service) {
 	// An initial pass at startup picks up anything that changed while the
 	// server was down.
 	if err := scanner.ScanAll(ctx); err != nil && ctx.Err() == nil {
 		log.Error().Err(err).Msg("startup scan failed")
 	}
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
 	for {
+		every := set.Get().General.ScanInterval.D()
+		if every <= 0 {
+			every = time.Hour
+		}
+		timer := time.NewTimer(every)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			if err := scanner.ScanAll(ctx); err != nil && ctx.Err() == nil {
-				log.Error().Err(err).Msg("scheduled scan failed")
-			}
+		case <-timer.C:
+		}
+		if set.Get().General.ScanInterval <= 0 {
+			continue
+		}
+		if err := scanner.ScanAll(ctx); err != nil && ctx.Err() == nil {
+			log.Error().Err(err).Msg("scheduled scan failed")
 		}
 	}
 }

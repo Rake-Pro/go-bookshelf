@@ -17,7 +17,7 @@ import (
 func (c *Catalog) Libraries(ctx context.Context, allowed []int64) ([]Library, error) {
 	query := `SELECT l.id, l.name, l.kind, l.created_at,
 		(SELECT count(*) FROM items i WHERE i.library_id = l.id AND i.missing_at IS NULL)
-		FROM libraries l ORDER BY l.name COLLATE NOCASE`
+		FROM libraries l ORDER BY lower(l.name)`
 	var args []any
 	if allowed != nil {
 		if len(allowed) == 0 {
@@ -30,7 +30,7 @@ func (c *Catalog) Libraries(ctx context.Context, allowed []int64) ([]Library, er
 		}
 		query = `SELECT l.id, l.name, l.kind, l.created_at,
 			(SELECT count(*) FROM items i WHERE i.library_id = l.id AND i.missing_at IS NULL)
-			FROM libraries l WHERE l.id IN (` + strings.Join(placeholders, ",") + `) ORDER BY l.name COLLATE NOCASE`
+			FROM libraries l WHERE l.id IN (` + strings.Join(placeholders, ",") + `) ORDER BY lower(l.name)`
 	}
 	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -108,18 +108,14 @@ func (c *Catalog) CreateLibrary(ctx context.Context, name, kind string, paths []
 	}
 	defer tx.Rollback()
 
-	res, err := tx.ExecContext(ctx,
+	id, err := tx.InsertReturningID(ctx,
 		`INSERT INTO libraries (name, kind, created_at) VALUES (?, ?, ?)`, strings.TrimSpace(name), kind, store.Now())
-	if err != nil {
-		return nil, err
-	}
-	id, err := res.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
 	for _, p := range cleanPaths(paths) {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO library_paths (library_id, path) VALUES (?, ?)`, id, p); err != nil {
+			`INSERT INTO library_paths (library_id, path) VALUES (?, ?) ON CONFLICT DO NOTHING`, id, p); err != nil {
 			return nil, err
 		}
 	}
@@ -159,7 +155,7 @@ func (c *Catalog) UpdateLibrary(ctx context.Context, id int64, name, kind *strin
 		}
 		for _, p := range cleanPaths(paths) {
 			if _, err := tx.ExecContext(ctx,
-				`INSERT OR IGNORE INTO library_paths (library_id, path) VALUES (?, ?)`, id, p); err != nil {
+				`INSERT INTO library_paths (library_id, path) VALUES (?, ?) ON CONFLICT DO NOTHING`, id, p); err != nil {
 				return nil, err
 			}
 		}
@@ -242,7 +238,7 @@ func (c *Catalog) seriesInProgress(ctx context.Context, userID int64, allowed []
 		GROUP BY s.id, s.name
 		HAVING count(DISTINCT CASE WHEN pr.finished_at IS NOT NULL THEN i.id END) > 0
 		   AND count(DISTINCT CASE WHEN pr.item_id IS NULL THEN i.id END) > 0
-		ORDER BY s.name COLLATE NOCASE
+		ORDER BY lower(s.name)
 		LIMIT 12`
 
 	rows, err := c.db.QueryContext(ctx, query, append([]any{userID}, args...)...)
@@ -279,7 +275,7 @@ func (c *Catalog) nextUnstartedInSeries(ctx context.Context, seriesID, userID in
 		JOIN item_series isr ON isr.item_id = i.id AND isr.series_id = ?
 		LEFT JOIN progress pr ON pr.item_id = i.id AND pr.user_id = ?
 		WHERE i.missing_at IS NULL AND pr.item_id IS NULL ` + strings.Replace(libFilter, "WHERE", "AND", 1) + `
-		ORDER BY coalesce(isr.sequence, 0), i.sort_title COLLATE NOCASE LIMIT 1`
+		ORDER BY coalesce(isr.sequence, 0), lower(i.sort_title) LIMIT 1`
 	rows, err := c.db.QueryContext(ctx, query, append([]any{seriesID, userID}, args...)...)
 	if err != nil {
 		return nil, err
@@ -340,8 +336,8 @@ func (c *Catalog) people(ctx context.Context, allowed []int64, role, search stri
 		where = append(where, "i.library_id IN ("+strings.Join(placeholders, ",")+")")
 	}
 	if s := strings.TrimSpace(search); s != "" {
-		where = append(where, `p.name LIKE ? ESCAPE '\'`)
-		args = append(args, "%"+escapeLike(s)+"%")
+		where = append(where, `lower(p.name) LIKE ? ESCAPE '\'`)
+		args = append(args, likePattern(s))
 	}
 	from := ` FROM people p JOIN item_people ip ON ip.person_id = p.id
 		JOIN items i ON i.id = ip.item_id WHERE ` + strings.Join(where, " AND ")
@@ -352,7 +348,7 @@ func (c *Catalog) people(ctx context.Context, allowed []int64, role, search stri
 	}
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT p.id, p.name, p.sort_name, count(DISTINCT i.id)`+from+
-			` GROUP BY p.id, p.name, p.sort_name ORDER BY coalesce(nullif(p.sort_name, ''), p.name) COLLATE NOCASE LIMIT ? OFFSET ?`,
+			` GROUP BY p.id, p.name, p.sort_name ORDER BY lower(coalesce(nullif(p.sort_name, ''), p.name)) LIMIT ? OFFSET ?`,
 		append(append([]any{}, args...), limit, offset)...)
 	if err != nil {
 		return nil, 0, err
@@ -386,8 +382,8 @@ func (c *Catalog) SeriesList(ctx context.Context, allowed []int64, search string
 		where = append(where, "i.library_id IN ("+strings.Join(placeholders, ",")+")")
 	}
 	if s := strings.TrimSpace(search); s != "" {
-		where = append(where, `s.name LIKE ? ESCAPE '\'`)
-		args = append(args, "%"+escapeLike(s)+"%")
+		where = append(where, `lower(s.name) LIKE ? ESCAPE '\'`)
+		args = append(args, likePattern(s))
 	}
 	from := ` FROM series s JOIN item_series isr ON isr.series_id = s.id
 		JOIN items i ON i.id = isr.item_id WHERE ` + strings.Join(where, " AND ")
@@ -398,7 +394,7 @@ func (c *Catalog) SeriesList(ctx context.Context, allowed []int64, search string
 	}
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT s.id, s.name, count(DISTINCT i.id)`+from+
-			` GROUP BY s.id, s.name ORDER BY s.name COLLATE NOCASE LIMIT ? OFFSET ?`,
+			` GROUP BY s.id, s.name ORDER BY lower(s.name) LIMIT ? OFFSET ?`,
 		append(append([]any{}, args...), limit, offset)...)
 	if err != nil {
 		return nil, 0, err
@@ -440,7 +436,7 @@ func (c *Catalog) Tags(ctx context.Context, allowed []int64, limit, offset int) 
 	}
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT t.id, t.name, count(DISTINCT i.id)`+from+
-			` GROUP BY t.id, t.name ORDER BY t.name COLLATE NOCASE LIMIT ? OFFSET ?`,
+			` GROUP BY t.id, t.name ORDER BY lower(t.name) LIMIT ? OFFSET ?`,
 		append(append([]any{}, args...), limit, offset)...)
 	if err != nil {
 		return nil, 0, err
@@ -724,14 +720,14 @@ func (c *Catalog) CreateBookmark(ctx context.Context, userID int64, b Bookmark) 
 		b.Locator = b.Locator[:1024]
 	}
 	b.CreatedAt = store.Now()
-	res, err := c.db.ExecContext(ctx,
+	id, err := c.db.InsertReturningID(ctx,
 		`INSERT INTO bookmarks (user_id, item_id, locator, position_ms, note, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		userID, b.ItemID, b.Locator, b.PositionMS, b.Note, b.CreatedAt)
 	if err != nil {
 		return b, err
 	}
-	b.ID, err = res.LastInsertId()
-	return b, err
+	b.ID = id
+	return b, nil
 }
 
 // DeleteBookmark removes one of a user's bookmarks.

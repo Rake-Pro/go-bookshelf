@@ -64,7 +64,7 @@ Three rules keep this simple:
 | `app/app.css` | Shell layout, buttons, forms, grids, states |
 | `app/main.js` | Route table, boot sequence, shell mount, SW registration |
 | `app/router.js` | Pattern matching, history API, link interception |
-| `app/api.js` | `request()`, `api.*`, `auth.*`, media URL builders, `ApiError` |
+| `app/api.js` | `request()`, `api.*`, `auth.*`, `setup.*`, media URL builders, `ApiError` |
 | `app/store.js` | `store` singleton: user, `reader`/`player`/`ui` settings, theme |
 | `app/player.js` | `player` singleton: transport, chapters, MediaSession, progress |
 | `app/epub.js` | HTTP loader + reader CSS generation for the vendored renderer |
@@ -132,8 +132,9 @@ Spacing scale: `--s1 4px`, `--s2 8px`, `--s3 12px`, `--s4 16px`, `--s6 24px`,
 | `/search?q=` | `views/search.js` | yes |
 | `/settings` | `views/settings.js` | yes |
 | `/admin`, `/admin/{section}` | `views/admin.js` | yes |
+| `/admin/settings` | `views/admin-settings.js` | yes |
 | `/login?next=` | `views/login.js` | no |
-| `/setup` | `views/setup.js` | no |
+| `/setup` | `views/setup.js` | no (the first-run wizard) |
 | anything else | `views/not-found.js` | yes |
 
 The server must serve `index.html` for every path that is not `/api/*`,
@@ -157,11 +158,50 @@ List endpoints are read as `{"items":[...],"total":n}`.
 | Call | Request | Response the frontend reads |
 |---|---|---|
 | `GET /auth/me` | - | `{id, username, display_name, role, libraries:[id], auth_method}` |
-| `GET /auth/status` | - | `{setup_required, oidc_enabled, oidc_start_url, version}` |
+| `GET /auth/status` | - | `{setup_required, setup_complete, oidc_enabled, oidc_start_url, local_login, version}` |
 | `POST /auth/login` | `{username, password}` | the same user object; sets the cookie |
 | `POST /auth/logout` | - | 204 or `{}` |
-| `POST /auth/setup` | `{token, username, password, display_name}` | user object |
 | `GET /auth/oidc/start` | - | plain link target, full page navigation |
+
+### First-run wizard
+
+One call per step, all `POST /api/v1/setup/{step}`. The first two run before
+anybody is signed in and opt out of the 401 redirect; the rest run as the
+administrator step 2 created.
+
+| Step | Request | Response the wizard reads |
+|---|---|---|
+| `token` | `{token}` | `{ok, suggested_base_url}` |
+| `admin` | `{token, username, password, display_name}` | user object; sets the cookie |
+| `base-url` | `{base_url}` | `{base_url, redirect_url}` |
+| `oidc` | `{skip:true}` or an OIDC document with `enabled:true` | `{oidc_enabled}` |
+| `library` | `{skip:true}` or `{name, kind, path}` | the library, 201 |
+| `complete` | - | `{setup_complete:true}` |
+
+Every step answers 409 once setup is finished, which is how a reload lands on
+`/admin` instead of an empty form. `views/setup.js` resumes rather than
+restarts: it reads `/auth/status` on mount, goes to `/admin` when setup is
+complete, and starts at the base URL step when somebody is already signed in
+(the one-time token has been spent by then).
+
+### Settings (admin)
+
+| Call | Body / response |
+|---|---|
+| `GET /admin/settings` | `{general, oidc, proxy_auth, metadata, metrics, setup_complete, updated_at, admin_recovery}` |
+| `PUT /admin/settings` | any subset of the same sections; absent fields keep their stored values |
+| `POST /admin/settings/oidc/test` | a candidate OIDC document -> `{ok, groups_claim, admin_group, user_group, redirect_url}` or `{ok:false, error}`, always 200 |
+
+`oidc` carries `has_client_secret` and never `client_secret`: the secret can be
+written but not read. Sending an empty `client_secret` keeps the stored one, so
+a form that never received it can still be saved. `oidc.active` is whether
+discovery actually succeeded, as distinct from `oidc.enabled`, which is only
+what is stored. `admin_recovery` mirrors the environment flag, so the page can
+say why the password form is still on offer after being turned off.
+
+`views/admin-settings.js` saves each card independently, so a rejected section
+cannot lose the edits in another. A save applies to the running server; the
+status line under each card is an `aria-live="polite"` region.
 
 ### Catalog
 
@@ -268,7 +308,7 @@ Notes for the backend:
 | `POST /users` | `{username, display_name, password, role}` |
 | `PATCH /users/{id}` | partial user |
 | `PUT /users/{id}/libraries` | `{libraries:[id]}` |
-| `GET /system/status` | `{version, db_size_bytes, counts:{ebooks, audiobooks}, libraries, users, last_scans, ...}` |
+| `GET /system/status` | `{version, db_driver, db_dsn (redacted), db_size_bytes (0 on Postgres), counts:{ebooks, audiobooks}, libraries, users, last_scans, oidc_enabled, local_login, settings_updated_at, base_url, ...}` |
 
 The scan button polls `GET /libraries/{id}/scans` every 2 s for up to 2 minutes
 and reads the newest entry; a row with `finished_at: null` renders as running.
@@ -284,24 +324,38 @@ GET /api/v1/auth/me
 401 -> {"error":{"code":"unauthorized","message":"authentication required"}}
 
 GET /api/v1/auth/status            (public; only called after the 401)
-200 -> {"setup_required": false, "oidc_enabled": true,
-        "oidc_start_url": "/api/v1/auth/oidc/start", "version": "0.1.0"}
+200 -> {"setup_required": false, "setup_complete": true, "oidc_enabled": true,
+        "oidc_start_url": "/api/v1/auth/oidc/start", "local_login": true,
+        "version": "0.1.0"}
 ```
 
 - `/auth/me` stays a pure "who am I". Its 401 body carries the standard error
   envelope and nothing else, so no capability information leaks onto a route
   that exists to answer one question.
-- `oidc_enabled` is true only when OIDC is fully configured (issuer + client id
-  + secret). It is the only thing that renders the "Sign in with SSO" button,
-  which is a plain link to `oidc_start_url`.
-- `setup_required` is true only before the first admin exists. On boot it sends
-  the user to `/setup`; `/login` also shows a link to it.
-- Both flags default to `false` when the status call fails, so an unreachable or
-  older backend degrades to password-only login instead of breaking the page.
+- `oidc_enabled` is true only when single sign-on is configured and its
+  discovery succeeded. It is the only thing that renders the "Sign in with SSO"
+  button, which is a plain link to `oidc_start_url`.
+- `local_login` is whether the password form may be shown. It is false only when
+  an administrator turned it off, and it is forced back to true by
+  `GOBOOKSHELF_ADMIN_RECOVERY` on the server. When it is false the form is
+  hidden and the SSO button moves above the fold; when both are false the page
+  says sign-in is unavailable rather than showing a form that cannot work.
+- `setup_required` is true until the wizard finishes (`setup_complete` is its
+  positive form). On boot it sends the user to `/setup`; `/login` also links to
+  it.
+- The flags degrade safely when the status call fails: `setup_required` and
+  `oidc_enabled` to false, `local_login` to true, so an unreachable or older
+  backend leaves a usable password form instead of a blank page.
 
 `/auth/status` is the only 401-adjacent call the frontend inspects; every other
 401 simply redirects to `/login?next=...`. `/login` and `/setup` are excluded
 from that redirect.
+
+**`403 setup_required`** is the other global redirect. While the wizard is
+unfinished the server refuses every ordinary `/api/v1` route with that code;
+`api.js` turns it into a navigation to `/setup`, the same way a 401 becomes a
+navigation to `/login`. Both handlers are installed by `main.js` so `api.js`
+never has to import the router.
 
 ## Settings keys
 
@@ -454,6 +508,15 @@ Treated as acceptance criteria, not polish:
   default source of the theme.
 - No state is signalled by color alone: progress bars pair with text, error and
   success blocks pair an icon and a heading with the color.
+- The setup wizard moves focus to the new step's heading (`tabindex="-1"`) and
+  then to its first control, so a step change is announced rather than silently
+  swapped; the step counter is real text, not a graphic.
+- Every field in the wizard and on the settings page is a real `<label>` wrapping
+  its control, with the explanation in a `.hint` inside the same label. Checkbox
+  rows use `.check`, which carries the 44 px minimum height.
+- The "Test connection" verdict and each settings card's save status are
+  `role="status" aria-live="polite"` regions, and they pair an icon with the
+  colour so a red line is never the only signal.
 
 ## Adding a view
 

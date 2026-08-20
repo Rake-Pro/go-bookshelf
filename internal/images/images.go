@@ -1,5 +1,11 @@
 // Package images handles cover artwork: decoding untrusted image bytes under a
-// pixel and time budget, producing thumbnails, and caching both on disk.
+// pixel and time budget, re-encoding them as bounded JPEGs, and an optional
+// on-disk cache.
+//
+// The artwork itself lives in the database. The cache here is a pure
+// optimisation and may be switched off entirely - NewStore("") returns a store
+// that reports itself disabled and never touches the filesystem - so a
+// deployment can run with no writable volume.
 package images
 
 import (
@@ -27,7 +33,7 @@ const (
 	MaxSourceSize = 32 << 20    // 32 MiB of encoded input
 	DecodeTimeout = 10 * time.Second
 	ThumbMaxDim   = 400
-	FullMaxDim    = 1400
+	FullMaxDim    = 1600
 	jpegQuality   = 82
 )
 
@@ -121,51 +127,103 @@ func Convert(ctx context.Context, src []byte, maxDim int) ([]byte, error) {
 	return EncodeJPEG(Resize(img, maxDim))
 }
 
-// Store is the on-disk cover cache under the data directory.
+// Variants of a cover. Both are JPEG; the thumbnail is what a grid of covers
+// loads, the full size is what the reader and the detail page show.
+const (
+	VariantThumb = "thumb"
+	VariantFull  = "full"
+)
+
+// MaxDim returns the pixel bound for a variant.
+func MaxDim(variant string) int {
+	if variant == VariantThumb {
+		return ThumbMaxDim
+	}
+	return FullMaxDim
+}
+
+// Variant normalises an arbitrary size parameter to one of the two variants.
+func Variant(s string) string {
+	if s == VariantThumb {
+		return VariantThumb
+	}
+	return VariantFull
+}
+
+// Store is the optional on-disk cover cache under the data directory. A store
+// built from an empty directory is disabled: every method is a no-op and no
+// path is ever created.
 type Store struct{ dir string }
 
-// NewStore creates the cache directory if needed.
+// NewStore creates the cache directory if needed. An empty dir yields a
+// disabled store rather than an error, because running without a local data
+// directory is a supported configuration and not a misconfiguration.
 func NewStore(dir string) (*Store, error) {
+	if dir == "" {
+		return &Store{}, nil
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("images: create cover cache %s: %w", dir, err)
 	}
 	return &Store{dir: dir}, nil
 }
 
-// Dir returns the cache root.
-func (s *Store) Dir() string { return s.dir }
+// Enabled reports whether this store caches anything.
+func (s *Store) Enabled() bool { return s != nil && s.dir != "" }
 
-// Path is the cache location for one item's cover at a size ("full"/"thumb").
-// Paths are derived from the numeric id only, so nothing from a book's
-// metadata can influence where bytes land.
-func (s *Store) Path(itemID int64, size string) string {
-	if size != "thumb" {
-		size = "full"
+// Dir returns the cache root, or "" when the cache is off.
+func (s *Store) Dir() string {
+	if s == nil {
+		return ""
 	}
-	return filepath.Join(s.dir, strconv.FormatInt(itemID, 10)+"-"+size+".jpg")
+	return s.dir
 }
 
-// Save re-encodes raw cover bytes into the cache at the given size and returns
-// the file path.
-func (s *Store) Save(ctx context.Context, itemID int64, size string, raw []byte) (string, error) {
-	maxDim := FullMaxDim
-	if size == "thumb" {
-		maxDim = ThumbMaxDim
+// Path is the cache location for one item's cover variant. Paths are derived
+// from the numeric id only, so nothing from a book's metadata can influence
+// where bytes land.
+func (s *Store) Path(itemID int64, variant string) string {
+	if !s.Enabled() {
+		return ""
 	}
-	encoded, err := Convert(ctx, raw, maxDim)
+	return filepath.Join(s.dir, strconv.FormatInt(itemID, 10)+"-"+Variant(variant)+".jpg")
+}
+
+// Read returns a cached variant and its modification time. The boolean is
+// false when the cache is off or the file is not there, which is not an error:
+// the caller falls back to the database.
+func (s *Store) Read(itemID int64, variant string) ([]byte, time.Time, bool) {
+	if !s.Enabled() {
+		return nil, time.Time{}, false
+	}
+	path := s.Path(itemID, variant)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return nil, time.Time{}, false
 	}
-	path := s.Path(itemID, size)
-	if err := os.WriteFile(path, encoded, 0o644); err != nil {
-		return "", err
+	var mod time.Time
+	if info, err := os.Stat(path); err == nil {
+		mod = info.ModTime()
 	}
-	return path, nil
+	return data, mod, true
+}
+
+// Put writes already-encoded JPEG bytes into the cache. A failure is reported
+// so the caller can log it, but it never invalidates the write that already
+// went to the database.
+func (s *Store) Put(itemID int64, variant string, jpeg []byte) error {
+	if !s.Enabled() {
+		return nil
+	}
+	return os.WriteFile(s.Path(itemID, variant), jpeg, 0o644)
 }
 
 // Remove deletes any cached covers for an item.
 func (s *Store) Remove(itemID int64) {
-	for _, size := range []string{"full", "thumb"} {
-		_ = os.Remove(s.Path(itemID, size))
+	if !s.Enabled() {
+		return
+	}
+	for _, variant := range []string{VariantFull, VariantThumb} {
+		_ = os.Remove(s.Path(itemID, variant))
 	}
 }
