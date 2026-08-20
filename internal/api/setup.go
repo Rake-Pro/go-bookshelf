@@ -2,9 +2,11 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/rake-pro/go-bookshelf/internal/auth"
@@ -200,10 +202,11 @@ func (a *API) setupLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Skip bool   `json:"skip"`
-		Name string `json:"name"`
-		Kind string `json:"kind"`
-		Path string `json:"path"`
+		Skip          bool   `json:"skip"`
+		Name          string `json:"name"`
+		Kind          string `json:"kind"`
+		Path          string `json:"path"`
+		CreateMissing bool   `json:"create_missing"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -225,6 +228,12 @@ func (a *API) setupLibrary(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusBadRequest, codeBadRequest, "kind must be ebook, audiobook or mixed")
 		return
+	}
+	if body.CreateMissing {
+		if err := ensureLibraryDir(path); err != nil {
+			writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
+			return
+		}
 	}
 	info, err := os.Stat(path)
 	if err != nil || !info.IsDir() {
@@ -304,4 +313,16 @@ func suggestedBaseURL(r *http.Request) string {
 func firstForwarded(v string) string {
 	first, _, _ := strings.Cut(v, ",")
 	return strings.ToLower(strings.TrimSpace(first))
+}
+
+// ensureLibraryDir creates a library directory on request (an empty media
+// share has none yet). The path must be absolute; creation is admin-only.
+func ensureLibraryDir(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("library path must be absolute")
+	}
+	if err := os.MkdirAll(path, 0o775); err != nil {
+		return fmt.Errorf("could not create %s: %v", path, err)
+	}
+	return nil
 }

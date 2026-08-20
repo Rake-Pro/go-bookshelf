@@ -239,13 +239,26 @@ function createLibraryForm(host) {
   ph.textContent = 'One absolute path per line, readable by the server.';
   paths.append(pl, pt, ph);
 
+  const create = document.createElement('div');
+  create.className = 'field';
+  const crow = document.createElement('label');
+  crow.className = 'check';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.name = 'create_missing';
+  cb.checked = true;
+  const cl = document.createElement('span');
+  cl.textContent = 'Create folders that do not exist yet';
+  crow.append(cb, cl);
+  create.append(crow);
+
   const submit = document.createElement('button');
   submit.type = 'submit';
   submit.className = 'btn btn--primary';
   submit.textContent = 'Create library';
 
   const out = document.createElement('div');
-  form.append(name, kind, paths, submit, out);
+  form.append(name, kind, paths, create, submit, out);
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -254,6 +267,7 @@ function createLibraryForm(host) {
       name: String(fd.get('name') || '').trim(),
       kind: String(fd.get('kind') || 'ebook'),
       paths: String(fd.get('paths') || '').split('\n').map((x) => x.trim()).filter(Boolean),
+      create_missing: fd.get('create_missing') === 'on',
     };
     if (!body.name || !body.paths.length) {
       out.replaceChildren(flash('A name and at least one path are required.', 'error'));

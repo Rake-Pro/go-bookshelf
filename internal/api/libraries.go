@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/rake-pro/go-bookshelf/internal/library"
 	"github.com/rs/zerolog/log"
@@ -36,12 +37,21 @@ func (a *API) createLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name  string   `json:"name"`
-		Kind  string   `json:"kind"`
-		Paths []string `json:"paths"`
+		Name          string   `json:"name"`
+		Kind          string   `json:"kind"`
+		Paths         []string `json:"paths"`
+		CreateMissing bool     `json:"create_missing"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
+	}
+	if body.CreateMissing {
+		for _, p := range body.Paths {
+			if err := ensureLibraryDir(strings.TrimSpace(p)); err != nil {
+				writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
+				return
+			}
+		}
 	}
 	lib, err := a.cat.CreateLibrary(r.Context(), body.Name, body.Kind, body.Paths)
 	if err != nil {

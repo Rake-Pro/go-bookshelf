@@ -80,7 +80,7 @@ export async function openBook(itemId) {
 function injectCSP(data) {
   if (typeof data !== 'string') return data;
   const meta = '<meta http-equiv="Content-Security-Policy" '
-    + 'content="script-src \'none\'; object-src \'none\'; base-uri \'none\';">';
+    + 'content="script-src \'none\'; object-src \'none\'; base-uri \'none\';" />';
   const m = /<head\b[^>]*>/i.exec(data);
   if (m) return data.slice(0, m.index + m[0].length) + meta + data.slice(m.index + m[0].length);
   const html = /<html\b[^>]*>/i.exec(data);

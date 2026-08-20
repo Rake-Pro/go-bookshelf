@@ -112,41 +112,54 @@ export default async function reader(ctx) {
 
   /* ---------- load ---------- */
 
-  try {
-    item = await api.item(ctx.params.id);
-    title.textContent = item?.title || 'Reading';
-    back.href = `/item/${encodeURIComponent(ctx.params.id)}`;
-
-    await import('../../vendor/foliate-js/view.js');
-    const book = await openBook(ctx.params.id);
-
-    view = document.createElement('foliate-view');
-    stage.replaceChildren(view);
-    await view.open(book);
-
-    view.addEventListener('relocate', (e) => onRelocate(e.detail));
-    view.addEventListener('load', (e) => hardenFrame(e.detail));
-
-    applySettings();
-
-    const locator = item?.progress?.locator;
-    const fraction = item?.progress?.percent;
+  // The book is opened only after this view is in the document: the
+  // renderer's iframe has no browsing context while detached, so opening it
+  // before the router mounts the element leaves the reader stuck.
+  let started = false;
+  async function start() {
+    if (started) return;
+    started = true;
     try {
-      if (locator) await view.init({ lastLocation: locator });
-      else {
-        await view.init({ showTextStart: true });
-        if (fraction) await view.goToFraction(fraction);
-      }
-    } catch {
-      // A stale or unparseable locator must not stop the book from opening.
-      await view.init({ showTextStart: true });
-    }
+      item = await api.item(ctx.params.id);
+      title.textContent = item?.title || 'Reading';
+      back.href = `/item/${encodeURIComponent(ctx.params.id)}`;
 
-    document.addEventListener('keydown', onKey, true);
-  } catch (e) {
-    stage.replaceChildren(errorView(e, () => navigate(location.pathname, { replace: true })));
-    return { el, title: 'Reader', destroy: cleanup };
+      await import('../../vendor/foliate-js/view.js');
+      const book = await openBook(ctx.params.id);
+
+      view = document.createElement('foliate-view');
+      stage.replaceChildren(view);
+      await view.open(book);
+
+      view.addEventListener('relocate', (e) => onRelocate(e.detail));
+      view.addEventListener('load', (e) => hardenFrame(e.detail));
+
+      applySettings();
+
+      const locator = item?.progress?.locator;
+      const fraction = item?.progress?.percent;
+      try {
+        if (locator) await view.init({ lastLocation: locator });
+        else {
+          await view.init({ showTextStart: true });
+          if (fraction) await view.goToFraction(fraction);
+        }
+      } catch {
+        // A stale or unparseable locator must not stop the book from opening.
+        await view.init({ showTextStart: true });
+      }
+
+      document.addEventListener('keydown', onKey, true);
+    } catch (e) {
+      stage.replaceChildren(errorView(e, () => navigate(location.pathname, { replace: true })));
+      return;
+    }
   }
+  const startWhenConnected = () => {
+    if (el.isConnected) { start(); return; }
+    requestAnimationFrame(startWhenConnected);
+  };
+  requestAnimationFrame(startWhenConnected);
 
   /* ---------- settings ---------- */
 
@@ -285,7 +298,7 @@ export default async function reader(ctx) {
 
   window.addEventListener('pagehide', saveNow);
 
-  return { el, title: item?.title || 'Reader', destroy: cleanup };
+  return { el, title: 'Reader', destroy: cleanup };
 }
 
 /** @param {string} label @param {() => void} onClick */
