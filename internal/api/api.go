@@ -297,3 +297,6 @@ func (a *API) RegisterRoot(mux *http.ServeMux) {
 func configIPAllowed(a *API, ip net.IP) bool {
 	return settings.IPInNets(ip, a.settings.MetricsAllowNets())
 }
+
+// Version is the build version stamped into the binary.
+func (a *API) Version() string { return a.version }

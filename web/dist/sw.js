@@ -8,7 +8,9 @@
  *   navigations                             network-first, app shell fallback
  *   anything else                           network, then cache
  *
- * Bump VERSION on every frontend change: the old caches are dropped on activate.
+* VERSION is rewritten to the build version by the server when it serves this
+ * file, so every release drops the old caches on activate. The literal below is
+ * only what a dev build uses.
  */
 
 const VERSION = 'v2';
