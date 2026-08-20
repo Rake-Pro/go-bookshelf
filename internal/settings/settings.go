@@ -280,6 +280,10 @@ func (s Settings) Validate() error {
 		if iss.Scheme != "http" && iss.Scheme != "https" {
 			return invalid("OIDC issuer must use http or https")
 		}
+		if base, err := url.Parse(s.General.BaseURL); err == nil && base.Host != "" &&
+			strings.EqualFold(base.Host, iss.Host) {
+			return invalid("OIDC issuer %q points at this application; it must be your identity provider's issuer URL (not the redirect URI)", s.OIDC.Issuer)
+		}
 		if s.OIDC.ClientID == "" {
 			return invalid("an OIDC client id is required")
 		}

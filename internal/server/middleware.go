@@ -15,17 +15,21 @@ import (
 // /api/v1/items/{id}/epub/ with its own, far stricter policy.
 const appCSP = "default-src 'self'; " +
 	"script-src 'self'; " +
-	"style-src 'self' 'unsafe-inline'; " +
+	// blob: on styles/fonts/frames - the reader serves chapter documents and
+	// their stylesheets and fonts from in-memory blobs (never remote).
+	"style-src 'self' 'unsafe-inline' blob:; " +
 	"img-src 'self' data: blob:; " +
 	"media-src 'self' blob:; " +
-	"font-src 'self' data:; " +
+	"font-src 'self' data: blob:; " +
 	"connect-src 'self'; " +
 	"worker-src 'self'; " +
 	"manifest-src 'self'; " +
 	"object-src 'none'; " +
 	"base-uri 'none'; " +
 	"form-action 'self'; " +
-	"frame-src 'self'; " +
+	// blob: - the reader renders each chapter from an in-memory document in a
+	// sandboxed iframe (no scripts), never from a remote frame.
+	"frame-src 'self' blob:; " +
 	"frame-ancestors 'self'"
 
 // securityHeaders sets defence-in-depth headers on every response. Handlers

@@ -127,10 +127,12 @@ export class MiniPlayer extends HTMLElement {
     root.append(wrap);
 
     this.#els = { open, img, t, s, time, play, fill };
-    this.hidden = true;
   }
 
   connectedCallback() {
+    // Attributes may only be set once connected: a custom element constructor
+    // that adds attributes makes document.createElement() throw.
+    if (!this.#wired) this.hidden = true;
     this.setAttribute('role', 'region');
     this.setAttribute('aria-label', 'Now playing');
     // The shell can be re-mounted after a full-screen route; only wire once.

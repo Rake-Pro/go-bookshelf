@@ -6,6 +6,25 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Reader: the book never rendered in a browser. Four causes, all client side:
+  the application CSP did not allow `blob:` frames, styles and fonts that the
+  renderer uses for chapter documents; the injected per-chapter CSP `<meta>`
+  tag was not self-closed, which made XHTML chapters unparseable; the book was
+  opened before the reader element was attached to the page, leaving the
+  renderer's iframe without a browsing context; and the mini-player set an
+  attribute in its constructor, which makes `document.createElement` throw.
+  Verified end to end in headless Chromium.
+
+### Added
+- Libraries: `create_missing` on `POST /api/v1/setup/library` and
+  `POST /api/v1/libraries` creates the directory first (checkbox in the wizard
+  and the admin form), so an empty media share no longer blocks setup.
+- Settings: an OIDC issuer that points at this application's own base URL is
+  rejected with a clear message instead of a confusing discovery 404.
+
+## [0.2.0] - 2026-08-20
+
 ### Added
 
 - **Postgres storage backend.** `GOBOOKSHELF_DB_DRIVER=postgres` with

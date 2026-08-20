@@ -208,6 +208,8 @@ export default async function setupView() {
       field('Path', 'path', 'text', {
         hint: 'One absolute path, readable by the server, for example /books.',
       }),
+      checkField('Create the folder if it does not exist yet', 'create_missing', true,
+        'Handy on a fresh, empty media share.'),
     );
 
     onSubmit(form, submit, err, async () => {
@@ -216,6 +218,7 @@ export default async function setupView() {
         name: String(fd.get('name') || '').trim(),
         kind: String(fd.get('kind') || 'mixed'),
         path: String(fd.get('path') || '').trim(),
+        create_missing: fd.get('create_missing') === 'on',
       };
       if (!body.name || !body.path) {
         throw new Error('Enter a name and a path, or choose "Skip for now".');
