@@ -189,6 +189,38 @@ function normalize(path) {
 }
 
 /**
+ * Reader palettes. Mirrors the `[data-reader-theme]` blocks in app/tokens.css:
+ * the chrome reads them as custom properties, the book iframe needs literal
+ * colors because the stylesheet injected into it has no access to the host
+ * document's variables. Change both together.
+ *
+ * @type {Record<string, {fg:string, bg:string, link:string, sel:string}>}
+ */
+export const READER_PALETTES = {
+  light: { fg: '#1f1d1a', bg: '#faf8f4', link: '#b04a17', sel: '#f0d8b4' },
+  sepia: { fg: '#4a3a29', bg: '#f4ecd8', link: '#8c4a1f', sel: '#e3cfa4' },
+  gray: { fg: '#1c1a18', bg: '#cbc7c0', link: '#7a3d16', sel: '#b0aba2' },
+  dark: { fg: '#cfc9c0', bg: '#0b0b0c', link: '#e8a06a', sel: '#3a352d' },
+  'hc-light': { fg: '#000000', bg: '#ffffff', link: '#0043a8', sel: '#ffe680' },
+  'hc-dark': { fg: '#ffffff', bg: '#000000', link: '#ffd400', sel: '#4d4000' },
+};
+
+/**
+ * Fallback family for the "publisher" setting: books that name no font of
+ * their own get a book-like serif instead of the browser's default, and the
+ * rule is deliberately not `!important` so a book's own font still wins.
+ */
+const SERIF_STACK = '"Iowan Old Style", "Palatino Linotype", Palatino, '
+  + 'Charter, Georgia, "Source Serif Pro", "Times New Roman", Times, serif';
+
+const FAMILIES = {
+  system: 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif',
+  serif: SERIF_STACK,
+  sans: 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif',
+  dyslexic: '"OpenDyslexic", "Lexie Readable", "Comic Sans MS", "Comic Neue", Verdana, sans-serif',
+};
+
+/**
  * Build the CSS injected into the book's iframe from the user's reader
  * settings. Kept here so the reader view stays about interaction.
  *
@@ -196,32 +228,27 @@ function normalize(path) {
  * @returns {string}
  */
 export function readerCSS(s) {
-  const fg = readerColor(s, 'fg');
-  const bg = readerColor(s, 'bg');
-  const family = {
-    system: 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif',
-    serif: 'Georgia, "Iowan Old Style", "Times New Roman", Times, serif',
-    sans: 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif',
-    dyslexic: '"OpenDyslexic", "Lexie Readable", "Comic Sans MS", "Comic Neue", Verdana, sans-serif',
-  }[s.font_family];
+  const p = readerPalette(s);
+  const family = FAMILIES[s.font_family];
 
   const align = s.align === 'publisher' ? '' : `text-align: ${s.align} !important;`;
-  const fontRule = family
-    ? `font-family: ${family} !important;`
-    : '';
+  const fontRule = family ? `font-family: ${family} !important;` : '';
 
   return `
 @namespace epub "http://www.idpf.org/2007/ops";
 html {
   color-scheme: ${isDarkReader(s) ? 'dark' : 'light'};
-  color: ${fg};
-  background: ${bg};
+  color: ${p.fg};
+  background: ${p.bg};
   font-size: ${s.font_scale}em;
+  font-family: ${SERIF_STACK};
   hyphens: auto;
+  -webkit-hyphens: auto;
+  text-rendering: optimizeLegibility;
 }
 body {
-  color: ${fg};
-  background: ${bg};
+  color: ${p.fg};
+  background: ${p.bg};
   line-height: ${s.line_height} !important;
   letter-spacing: ${s.letter_spacing}em !important;
   word-spacing: ${s.word_spacing}em !important;
@@ -236,27 +263,30 @@ p, li, blockquote, dd, div {
   ${align}
 }
 p { margin-block: ${s.paragraph_spacing}em !important; }
-a, a:visited { color: ${readerColor(s, 'link')}; }
+h1, h2, h3, h4, h5, h6 { color: ${p.fg}; line-height: 1.25 !important; text-align: initial; }
+a, a:link, a:visited { color: ${p.link}; text-decoration-thickness: 1px; text-underline-offset: 0.15em; }
 img, svg, video { max-width: 100% !important; height: auto !important; }
-::selection { background: ${fg}; color: ${bg}; }
+hr { border-color: ${p.link}; opacity: 0.4; }
+::selection { background: ${p.sel}; color: ${p.fg}; }
 `;
 }
 
-/** @param {any} s @param {'fg'|'bg'|'link'} which */
-function readerColor(s, which) {
-  const map = {
-    light: { fg: '#1f1d1a', bg: '#faf8f4', link: '#c2561f' },
-    dark: { fg: '#ece7df', bg: '#141210', link: '#e8834f' },
-    sepia: { fg: '#5b4636', bg: '#f4ecd8', link: '#8c4a1f' },
-    'hc-light': { fg: '#000000', bg: '#ffffff', link: '#0043a8' },
-    'hc-dark': { fg: '#ffffff', bg: '#000000', link: '#ffd400' },
-  };
+/**
+ * Resolved colors for a settings object. Custom mixes its selection color from
+ * the two chosen colors so it stays legible whichever way round they are.
+ * @param {any} s
+ * @returns {{fg:string, bg:string, link:string, sel:string}}
+ */
+export function readerPalette(s) {
   if (s.theme === 'custom') {
-    if (which === 'fg') return s.custom_fg;
-    if (which === 'bg') return s.custom_bg;
-    return s.custom_fg;
+    return {
+      fg: s.custom_fg,
+      bg: s.custom_bg,
+      link: s.custom_fg,
+      sel: `color-mix(in srgb, ${s.custom_fg} 22%, ${s.custom_bg})`,
+    };
   }
-  return (map[s.theme] || map.light)[which];
+  return READER_PALETTES[s.theme] || READER_PALETTES.light;
 }
 
 /** @param {any} s */

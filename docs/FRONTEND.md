@@ -78,6 +78,7 @@ Three rules keep this simple:
 | `app/components/mini-player.js` | `<bs-mini-player>` |
 | `app/components/sheet.js` | `<bs-sheet>` modal bottom sheet, `openSheet()` |
 | `app/components/reader-settings.js` | Reader settings controls (reader + settings page) |
+| `app/components/add-books.js` | `addBooksButton()`, `openAddBooks()`: the upload / URL-import sheet |
 | `app/views/*.js` | One module per route |
 | `vendor/foliate-js/` | Pinned EPUB renderer, MIT, see `vendor/VERSIONS.md` |
 
@@ -88,6 +89,10 @@ Three rules keep this simple:
 | Item card | `bs-item-card` | Shadow DOM. One link per tile; accessible name carries title, author, kind and progress. Lazy-loaded 2:3 cover with a text fallback. |
 | Mini player | `bs-mini-player` | Shadow DOM. Hidden until something is loaded. Subscribes to `player` events once, survives shell re-mounts. |
 | Sheet | `bs-sheet` | Wraps `<dialog>` + `showModal()` for free focus trapping and Escape. Bottom sheet on narrow screens, centered panel from 48rem. |
+
+`add-books.js` renders inside `bs-sheet`, so its content lives in that shadow
+root and `app.css` does not reach it; the styles it needs travel with it as a
+`<style>` node it appends to its own subtree.
 
 Non-element modules (`app-shell`, `page`, `states`, `icons`, `reader-settings`)
 export plain builder functions and use light DOM so `app.css` applies.
@@ -106,7 +111,13 @@ All color, spacing, radius and font values are CSS custom properties in
   hardens borders and mutes automatically.
 - **Reader theme** is separate from the app theme and is written to
   `<html data-reader-theme>` while the reader is open:
-  `light | dark | sepia | hc-light | hc-dark | custom`.
+  `light | sepia | gray | dark | hc-light | hc-dark | custom`. Each theme sets
+  `--reader-bg/-fg/-link/-sel/-chrome/-border/-muted` in `tokens.css`; the
+  reader view re-points the shell tokens (`--surface`, `--text`, `--border`,
+  `--accent`, ...) at them so its bars and sheets match the page. The same
+  colors exist once more as literals in `app/epub.js` (`READER_PALETTES`),
+  because the stylesheet injected into the book iframe cannot read the host
+  document's variables - change both together.
 - **Reduced motion**: a global `prefers-reduced-motion` block disables every
   transition and animation.
 - `<meta name="theme-color">` is rewritten whenever the theme resolves.
@@ -290,6 +301,7 @@ Notes for the backend:
 | `GET /me/bookmarks?item={id}` | `{items:[{id, item_id, position_ms, locator, note, created_at}]}` |
 | `POST /me/bookmarks` | `{item_id, position_ms?, locator?, note?}` |
 | `DELETE /me/bookmarks/{id}` | - |
+| `GET /me/imports` | `{items:[{id, url, status, message, item_id, created_at, updated_at}]}` newest first |
 
 `PUT /me/settings` receives a **partial** document. Sending only
 `{"reader":{"font_scale":1.3}}` must not clear `player` or `ui`.
@@ -305,13 +317,52 @@ Notes for the backend:
 | `POST /libraries/{id}/scan` | `{scan_id}` |
 | `GET /libraries/{id}/scans` | `{items:[{id, started_at, finished_at, added, updated, removed, errors}]}` newest first |
 | `GET /users` | `{items:[{id, username, display_name, role, disabled_at}]}` |
-| `POST /users` | `{username, display_name, password, role}` |
+| `POST /users` | `{username, display_name, password, role, can_upload?}` |
 | `PATCH /users/{id}` | partial user |
 | `PUT /users/{id}/libraries` | `{libraries:[id]}` |
 | `GET /system/status` | `{version, db_driver, db_dsn (redacted), db_size_bytes (0 on Postgres), counts:{ebooks, audiobooks}, libraries, users, last_scans, oidc_enabled, local_login, settings_updated_at, base_url, ...}` |
 
 The scan button polls `GET /libraries/{id}/scans` every 2 s for up to 2 minutes
 and reads the newest entry; a row with `finished_at: null` renders as running.
+
+### Adding books
+
+| Call | Body / response |
+|---|---|
+| `POST /libraries/{id}/upload` | `multipart/form-data`: `subdir` field first, then one or more `files` parts. 201 `{status:"complete"|"scanning", files:[{filename, kind, title, author, size_bytes, item_id}]}` |
+| `POST /libraries/{id}/import` | `{url}` -> 202 `{id, status, url, message, item_id}` |
+| `GET /imports/{id}` | the job |
+| `DELETE /imports/{id}` | cancel a queued or running job, or clear a finished one |
+
+The button is built by `addBooksButton()`, which answers `null` unless
+`store.canUpload` - that is, unless `GET /auth/me` said `can_upload: true`. The
+server folds the role into the flag before answering, so the frontend has one
+boolean to read and no rule to reimplement. Returning `null` rather than a
+disabled button is deliberate: there is nothing the user could do to make it
+work, so offering it would be a lie.
+
+The sheet has two tabs (`role="tablist"`, arrow keys, Home and End move between
+them; each panel is a `tabpanel` labelled by its tab):
+
+- **Upload files.** A drop zone that is also a real button for the keyboard,
+  plus a file picker whose `accept` follows the chosen library's kind. The whole
+  selection goes in **one** request, because the server groups an audiobook's
+  files into one book by their tags and can only do that if it sees them
+  together. Progress comes from `uploadBooks()` in `api.js`, which is the one
+  call that uses `XMLHttpRequest` rather than `fetch`: `fetch` cannot report how
+  much of a request body has been sent, and an upload with no progress bar is
+  indistinguishable from a hung one when the file is an audiobook. Per-file bars
+  are derived from the single upload event by scaling the wire total against the
+  sum of the real file sizes, which keeps them honest without modelling the
+  multipart encoding. `uploadBooks()` returns `{promise, cancel}`, and closing
+  the sheet aborts the transfer rather than orphaning it.
+- **From a URL.** A field, a submit, and the job list, re-read every 2 s while
+  anything is queued or running and then left alone. Each row can be cancelled.
+  A job that reaches `done` links to the item it produced.
+
+Both panels announce their outcomes through `announce()` into the polite live
+region, and the job list only speaks when a job actually changes state, so it
+does not repeat itself every two seconds.
 
 ## Auth probe
 
@@ -367,15 +418,15 @@ Writes are merged and debounced 500 ms, and flushed on `pagehide`.
 
 | Key | Type | Default | Range / values |
 |---|---|---|---|
-| `font_scale` | number | `1.0` | 0.7-2.5 step 0.1 |
+| `font_scale` | number | `1.15` | 0.7-2.5 step 0.05 |
 | `font_family` | string | `publisher` | `publisher\|system\|serif\|sans\|dyslexic` |
-| `line_height` | number | `1.5` | 1.0-2.4 step 0.05 |
+| `line_height` | number | `1.6` | 1.0-3.0, 1.2-2.4 in the UI |
 | `letter_spacing` | number (em) | `0` | -0.05-0.3 step 0.01 |
 | `word_spacing` | number (em) | `0` | 0-1 step 0.05 |
 | `paragraph_spacing` | number (em) | `0` | 0-3 step 0.25 |
-| `margin` | string | `normal` | `narrow\|normal\|wide` (12/36/72 px) |
+| `margin` | string | `normal` | `narrow\|normal\|wide` (x0.6 / x1 / x1.6) |
 | `align` | string | `publisher` | `publisher\|left\|justify` |
-| `theme` | string | `light` | `light\|dark\|sepia\|hc-light\|hc-dark\|custom` |
+| `theme` | string | `light` | `light\|sepia\|gray\|dark\|hc-light\|hc-dark\|custom` |
 | `custom_fg` | string | `#1f1d1a` | hex, used when `theme=custom` |
 | `custom_bg` | string | `#faf8f4` | hex, used when `theme=custom` |
 | `layout` | string | `paginated` | `paginated\|scrolled` |
@@ -426,21 +477,51 @@ Hardening, in three layers:
 3. On `load`, any surviving `<script>` node is removed and external links get
    `target="_blank" rel="noopener noreferrer nofollow"`.
 
+Layout. `views/reader.js` never touches the layout engine; it only sets
+documented `<foliate-paginator>` attributes, recomputed on open, on a settings
+change, on resize and on every section load:
+
+| Attribute | Value |
+|---|---|
+| `flow` | `paginated`, or `scrolled` for the scrolled reading mode |
+| `max-inline-size` | `38em x font_scale`, **in px** - the renderer parses this value as a number of pixels, so a `rem` value would be read as that many pixels |
+| `max-column-count` | `2` only when the viewport is landscape and at least 1100px wide (the renderer already forces one column in portrait), `1` otherwise and always while a cover or title page is showing |
+| `max-block-size` | the viewport height, so the text block fills it instead of stopping at the renderer's 1440px default |
+| `gap` | `7% x margin factor`, clamped to 3.5-14% |
+| `margin` | the running-head band, `5.5% of the viewport height x margin factor`, clamped to 30-72px |
+| `animated` | set unless `prefers-reduced-motion` |
+
+The margin factor is 0.6 / 1 / 1.6 for `narrow` / `normal` / `wide`. A section
+whose text is shorter than 400 characters is treated as a cover, title page or
+part divider and laid out as one centered column; the decision is made in the
+renderer's `load` event, which fires before the page is measured.
+
 Interaction:
 
+- Chrome: the top bar and footer float over the page. They hide two seconds
+  after the book opens, on a keyboard page turn, and immediately on a tap or
+  swipe page turn. A tap in the center zone toggles them and keeps them up; any
+  key brings them back; `focusin` on a bar cancels the timer and `focusout`
+  restarts it. Hidden means `visibility: hidden` plus `inert` and
+  `aria-hidden="true"` - never removed from the DOM.
 - Tap zones: left 1fr / center 1.2fr / right 1fr. They are real `<button>`s with
-  labels, so they are keyboard reachable and screen-reader legible. Center
-  toggles the chrome.
-- Top bar: back, title, contents, settings. Bottom bar: position slider plus a
-  "Page x of y" readout (falling back to "N% through" when the renderer cannot
-  supply a location count).
+  labels, so they are keyboard reachable and screen-reader legible. A horizontal
+  drag of 45px or more on the same layer pages instead, and suppresses the click
+  that follows it. The zones are removed in the scrolled reading mode, where
+  they would otherwise swallow scrolling, and the chrome then stays up.
+- Top bar: back, title, contents, settings. Footer: position slider, then the
+  pages left in the current chapter (or the chapter title when the renderer has
+  no page count) and the "Page x of y" readout, which falls back to
+  "N% through" when the renderer cannot supply a location count.
 - Keys: Left/PageUp previous, Right/PageDown/Space next, Home/End jump,
   `t` contents, `s` settings, Escape back to the item. The handler is attached
   to both the host document and each loaded book document, because key events
   inside the iframe do not bubble out.
-- Settings changes call `renderer.setStyles(readerCSS(settings))` and update the
-  paginator attributes (`flow`, `margin`, `gap`, `max-column-count`,
-  `max-inline-size`). The book is never rewritten.
+- Announcements are throttled to one every 1.5 s and never repeat the same
+  string, so holding a page key does not flood the live region.
+- Settings changes call `renderer.setStyles(readerCSS(settings))` and reapply
+  the attributes above. The book is never rewritten. Reading settings open in a
+  sheet that docks to the side from 900px wide, so the page previews the change.
 - Progress: every relocation is debounced 1.2 s and pushed as
   `PUT /me/progress/{id}` with `locator` (EPUB CFI) and `percent`. Also flushed
   on `pagehide` and on leaving the route.

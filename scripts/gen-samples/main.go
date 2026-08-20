@@ -1,31 +1,106 @@
 // Command gen-samples writes a small synthetic library - one EPUB, one M4B and
 // one multi-file MP3 audiobook - into a directory, so the smoke test has
 // something to ingest without shipping real books in the repository.
+//
+// With -inbox it also writes one book that is deliberately not part of any
+// library, which is what the smoke test uploads and imports; with -serve it
+// then stays running as a plain file server over that directory, so the URL
+// import has somewhere on the local machine to fetch from.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"image/color"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/rake-pro/go-bookshelf/internal/fixtures"
 )
 
 func main() {
 	dir := flag.String("dir", "", "directory to write the sample library into")
+	inbox := flag.String("inbox", "", "also write one book here, outside any library, for the upload and import steps")
+	serve := flag.String("serve", "", "after writing, serve -inbox over HTTP on this address and block")
 	flag.Parse()
 
-	if *dir == "" {
-		fmt.Fprintln(os.Stderr, "gen-samples: -dir is required")
+	if *dir == "" && *inbox == "" {
+		fmt.Fprintln(os.Stderr, "gen-samples: -dir or -inbox is required")
 		os.Exit(2)
 	}
-	if err := generate(*dir); err != nil {
-		fmt.Fprintln(os.Stderr, "gen-samples:", err)
-		os.Exit(1)
+	if *dir != "" {
+		if err := generate(*dir); err != nil {
+			fmt.Fprintln(os.Stderr, "gen-samples:", err)
+			os.Exit(1)
+		}
+		fmt.Println("sample library written to", *dir)
 	}
-	fmt.Println("sample library written to", *dir)
+	if *inbox != "" {
+		if err := generateInbox(*inbox); err != nil {
+			fmt.Fprintln(os.Stderr, "gen-samples:", err)
+			os.Exit(1)
+		}
+		fmt.Println("inbox written to", *inbox)
+	}
+	if *serve != "" {
+		if *inbox == "" {
+			fmt.Fprintln(os.Stderr, "gen-samples: -serve needs -inbox")
+			os.Exit(2)
+		}
+		srv := &http.Server{
+			Addr:              *serve,
+			Handler:           http.FileServer(http.Dir(*inbox)),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		fmt.Println("serving", *inbox, "on", *serve)
+		if err := srv.ListenAndServe(); err != nil {
+			fmt.Fprintln(os.Stderr, "gen-samples:", err)
+			os.Exit(1)
+		}
+	}
+}
+
+// generateInbox writes one book that no library holds. It has to be a
+// different book from anything in the sample library, or the upload would be
+// refused as a duplicate - which is correct behaviour, and not what the upload
+// step is trying to prove.
+func generateInbox(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	// Three distinct books, because the duplicate check is server-wide: the
+	// smoke test needs one to upload, one to import and one to try to write
+	// outside the library with, and no two of them can be the same bytes.
+	books := []struct {
+		file, title, chapter string
+	}{
+		{"morning.epub", "The Long Morning", "The morning began, as mornings do."},
+		{"noon.epub", "The Long Noon", "By noon it was warm, and nothing much had happened."},
+		{"dusk.epub", "The Long Dusk", "At dusk the light went, slowly, and then all at once."},
+	}
+	for _, b := range books {
+		if err := fixtures.WriteEPUB(filepath.Join(dir, b.file), fixtures.EPUBOptions{
+			Title:       b.title,
+			Authors:     []string{"A. Writer"},
+			Language:    "en",
+			Description: "A sample book generated for the upload and import smoke steps.",
+			Publisher:   "Example Press",
+			Date:        "2022",
+			Chapters: map[string]string{
+				"c1.xhtml": "<h1>One</h1><p>" + b.chapter + "</p>",
+			},
+			ChapterOrder: []string{"c1.xhtml"},
+			Cover:        fixtures.PNG(400, 600, color.RGBA{R: 200, G: 140, B: 40, A: 255}),
+		}); err != nil {
+			return fmt.Errorf("write inbox epub: %w", err)
+		}
+	}
+	// A file whose name claims to be a book and whose bytes are not, so the
+	// smoke test can watch the magic-byte check refuse it.
+	return os.WriteFile(filepath.Join(dir, "not-a-book.epub"),
+		[]byte("This is a text file with an EPUB extension.\n"), 0o644)
 }
 
 func generate(dir string) error {

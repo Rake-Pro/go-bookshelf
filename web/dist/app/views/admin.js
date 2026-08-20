@@ -10,6 +10,7 @@ import { emptyView, errorView, errorMessage, loadingView } from '../components/s
 import { icon } from '../components/icons.js';
 import { date, bytes } from '../format.js';
 import { announce } from '../live.js';
+import { addBooksButton } from '../components/add-books.js';
 
 /** @param {import('../router.js').RouteCtx} ctx */
 export default async function admin(ctx) {
@@ -86,6 +87,17 @@ async function renderLibraries(host) {
     ul.className = 'linklist';
     for (const lib of list) ul.append(libraryRow(lib, host));
     c.append(ul);
+  }
+
+  // Adding books is not an admin power, but the admin page is where the
+  // libraries are, so the same button lives here too.
+  const add = addBooksButton({ libraries: list, onAdded: () => renderLibraries(host) });
+  if (add) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.marginTop = 'var(--s4)';
+    row.append(add);
+    c.append(row);
   }
 
   c.append(createLibraryForm(host));
@@ -321,6 +333,9 @@ async function renderUsers(host) {
     s.textContent = `${u.username} - ${u.role}${u.disabled_at ? ' - disabled' : ''}`;
     who.append(n, s);
     row.append(who);
+    const sp = document.createElement('span');
+    sp.className = 'spacer';
+    row.append(sp, uploadToggle(u, host));
     li.append(row);
     table.append(li);
   }
@@ -329,6 +344,46 @@ async function renderUsers(host) {
 
   c.append(createUserForm(host));
   host.replaceChildren(c);
+}
+
+/**
+ * The per-account "may add books" switch.
+ *
+ * An administrator always may and a restricted account never may, so for those
+ * two the control states the rule instead of pretending to offer a choice.
+ *
+ * @param {any} u @param {HTMLElement} host
+ */
+function uploadToggle(u, host) {
+  if (u.role === 'admin' || u.role === 'restricted') {
+    const note = document.createElement('span');
+    note.className = 'muted small';
+    note.textContent = u.role === 'admin' ? 'Can add books' : 'Cannot add books';
+    return note;
+  }
+  const wrap = document.createElement('label');
+  wrap.className = 'check row';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = u.can_upload === true;
+  const text = document.createElement('span');
+  text.className = 'small';
+  text.textContent = 'Can add books';
+  cb.addEventListener('change', async () => {
+    cb.disabled = true;
+    try {
+      await api.updateUser(u.id, { can_upload: cb.checked });
+      announce(`${u.username} ${cb.checked ? 'can' : 'cannot'} add books`);
+    } catch (err) {
+      cb.checked = !cb.checked;
+      announce(errorMessage(err));
+    } finally {
+      cb.disabled = false;
+      renderUsers(host);
+    }
+  });
+  wrap.append(cb, text);
+  return wrap;
 }
 
 /** @param {HTMLElement} host */
@@ -363,6 +418,18 @@ function createUserForm(host) {
   }
   roleWrap.append(rl, rs);
 
+  const uploadWrap = document.createElement('div');
+  uploadWrap.className = 'field';
+  const uploadRow = document.createElement('label');
+  uploadRow.className = 'check';
+  const uploadBox = document.createElement('input');
+  uploadBox.type = 'checkbox';
+  uploadBox.name = 'can_upload';
+  const uploadText = document.createElement('span');
+  uploadText.textContent = 'Can add books (upload and import)';
+  uploadRow.append(uploadBox, uploadText);
+  uploadWrap.append(uploadRow);
+
   const submit = document.createElement('button');
   submit.type = 'submit';
   submit.className = 'btn btn--primary';
@@ -373,7 +440,7 @@ function createUserForm(host) {
     textField('Username', 'username', ''),
     textField('Display name', 'display_name', ''),
     textField('Password', 'password', '', 'password'),
-    roleWrap, submit, out,
+    roleWrap, uploadWrap, submit, out,
   );
 
   form.addEventListener('submit', async (e) => {
@@ -384,6 +451,7 @@ function createUserForm(host) {
       display_name: String(fd.get('display_name') || '').trim(),
       password: String(fd.get('password') || ''),
       role: String(fd.get('role') || 'user'),
+      can_upload: fd.get('can_upload') === 'on',
     };
     if (!body.username || !body.password) {
       out.replaceChildren(flash('Username and password are required.', 'error'));

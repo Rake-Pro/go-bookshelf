@@ -237,6 +237,22 @@ export const api = {
   /** @param {object} data a candidate OIDC document @returns {Promise<{ok:boolean, error?:string}>} */
   testOidc: (data) => send('/admin/settings/oidc/test', data),
 
+  /* -------- adding books -------- */
+
+  /**
+   * Queue a URL import. Answers 202 with the job; the job list is polled from
+   * there, because fetching somebody else's site outlives the request.
+   * @param {string} libraryId @param {string} url
+   * @returns {Promise<{id:number,status:string,url:string,message:string,item_id:number}>}
+   */
+  importUrl: (libraryId, url) => send(`/libraries/${encodeURIComponent(libraryId)}/import`, { url }),
+  /** The caller's own import jobs, newest first. An admin sees everybody's. */
+  imports: () => request('/me/imports'),
+  /** @param {string|number} id */
+  importJob: (id) => request(`/imports/${encodeURIComponent(id)}`),
+  /** Cancel a queued or running import, or clear a finished one. */
+  cancelImport: (id) => request(`/imports/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
   settings: () => request('/me/settings'),
   /** @param {{reader?:object,player?:object,ui?:object}} s */
   putSettings: (s) => send('/me/settings', s, 'PUT'),
@@ -276,3 +292,48 @@ export const downloadUrl = (itemId) =>
 /** Root of the extracted EPUB container for an item (no trailing slash). */
 export const epubRoot = (itemId) =>
   `${BASE}/items/${encodeURIComponent(itemId)}/epub`;
+
+/* ---------------- uploads ---------------- */
+
+/**
+ * Upload books to a library.
+ *
+ * This is the one call that does not go through `request`: fetch cannot report
+ * how much of a request body has been sent, and an upload with no progress bar
+ * is indistinguishable from a hung one when the file is an audiobook. XHR can,
+ * so XHR is what this uses - and it returns the abort handle with the promise,
+ * so closing the sheet stops the transfer instead of orphaning it.
+ *
+ * The whole selection goes in one request: the server groups an audiobook's
+ * files into one book by their tags, and it can only do that if it sees them
+ * together.
+ *
+ * @param {string} libraryId
+ * @param {FormData} form `files` parts, and an optional `subdir` field first
+ * @param {(loaded:number, total:number) => void} [onProgress]
+ * @returns {{promise:Promise<any>, cancel:() => void}}
+ */
+export function uploadBooks(libraryId, form, onProgress) {
+  const xhr = new XMLHttpRequest();
+  const promise = new Promise((resolve, reject) => {
+    xhr.open('POST', `${BASE}/libraries/${encodeURIComponent(libraryId)}/upload`);
+    xhr.setRequestHeader('Accept', 'application/json');
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable) onProgress?.(e.loaded, e.total);
+    });
+    xhr.addEventListener('load', () => {
+      let body = null;
+      try { body = JSON.parse(xhr.responseText); } catch { body = null; }
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(body); return; }
+      const err = body && typeof body === 'object' ? body.error : null;
+      if (xhr.status === 401) onUnauthorized(location.pathname + location.search);
+      reject(new ApiError(xhr.status, err?.code || String(xhr.status), err?.message || '', body));
+    });
+    xhr.addEventListener('error', () =>
+      reject(new ApiError(0, 'network', 'Cannot reach the server. Check your connection.')));
+    xhr.addEventListener('abort', () =>
+      reject(new ApiError(0, 'aborted', 'The upload was cancelled.')));
+    xhr.send(form);
+  });
+  return { promise, cancel: () => xhr.abort() };
+}

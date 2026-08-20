@@ -71,11 +71,30 @@ type User struct {
 	CreatedAt   string `json:"created_at"`
 	Disabled    bool   `json:"disabled"`
 	HasPassword bool   `json:"has_password"`
+	CanUpload   bool   `json:"can_upload"`
 	OIDCSubject string `json:"-"`
 }
 
 // IsAdmin reports whether the user holds the admin role.
 func (u *User) IsAdmin() bool { return u != nil && u.Role == RoleAdmin }
+
+// MayUpload reports whether the user may add books to a library, by upload or
+// by URL import. An administrator always may; the restricted role never may,
+// whatever the flag says, because "restricted" exists to describe an account
+// that may only read what it has been given. Everyone in between is decided by
+// the per-account flag.
+func (u *User) MayUpload() bool {
+	if u == nil {
+		return false
+	}
+	if u.Role == RoleAdmin {
+		return true
+	}
+	if u.Role == RoleRestricted {
+		return false
+	}
+	return u.CanUpload
+}
 
 // Identity is an authenticated request's principal plus how it proved itself.
 type Identity struct {
@@ -228,10 +247,13 @@ func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 		disabledAt  sql.NullString
 		createdAt   string
 		usernameRaw string
+		canUpload   int64
 	)
-	if err := row.Scan(&u.ID, &usernameRaw, &display, &passwd, &subject, &u.Role, &createdAt, &disabledAt); err != nil {
+	if err := row.Scan(&u.ID, &usernameRaw, &display, &passwd, &subject, &u.Role, &createdAt,
+		&disabledAt, &canUpload); err != nil {
 		return nil, err
 	}
+	u.CanUpload = canUpload != 0
 	u.Username = usernameRaw
 	u.DisplayName = display.String
 	u.CreatedAt = createdAt
@@ -241,7 +263,7 @@ func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	return &u, nil
 }
 
-const userColumns = `id, username, display_name, password_hash, oidc_subject, role, created_at, disabled_at`
+const userColumns = `id, username, display_name, password_hash, oidc_subject, role, created_at, disabled_at, can_upload`
 
 // UserByID looks up a user by id.
 func (m *Manager) UserByID(ctx context.Context, id int64) (*User, error) {
@@ -360,6 +382,19 @@ func (m *Manager) SetRole(ctx context.Context, userID int64, role string) error 
 		return fmt.Errorf("auth: unknown role %q", role)
 	}
 	_, err := m.db.ExecContext(ctx, `UPDATE users SET role = ? WHERE id = ?`, role, userID)
+	return err
+}
+
+// SetCanUpload grants or withdraws the per-account permission to add books.
+// The value is stored for every role, including the two that ignore it, so
+// promoting a restricted account later restores what an administrator chose
+// rather than silently clearing it.
+func (m *Manager) SetCanUpload(ctx context.Context, userID int64, allowed bool) error {
+	flag := 0
+	if allowed {
+		flag = 1
+	}
+	_, err := m.db.ExecContext(ctx, `UPDATE users SET can_upload = ? WHERE id = ?`, flag, userID)
 	return err
 }
 

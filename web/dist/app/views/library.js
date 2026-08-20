@@ -8,7 +8,8 @@ import { api } from '../api.js';
 import { page } from '../components/page.js';
 import { itemGrid } from '../components/item-card.js';
 import { emptyView, errorView, skeletonGrid } from '../components/states.js';
-import { navigate } from '../router.js';
+import { navigate, router } from '../router.js';
+import { addBooksButton } from '../components/add-books.js';
 
 const PAGE_SIZE = 60;
 
@@ -67,6 +68,18 @@ export default async function library(ctx) {
   try {
     const libs = await api.libraries();
     const list = libs?.items || [];
+    // "Add books" appears only for an account that may; the button builder
+    // answers null otherwise rather than offering something that cannot work.
+    const add = addBooksButton({
+      libraries: list,
+      libraryId,
+      onAdded: () => router.refresh(),
+    });
+    if (add) {
+      const sp = document.createElement('span');
+      sp.className = 'spacer';
+      el.firstElementChild?.append(sp, add);
+    }
     controls.append(
       select('Library', libraryId, [
         ['', 'All libraries'],

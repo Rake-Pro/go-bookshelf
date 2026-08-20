@@ -261,6 +261,11 @@ func TestSecurityAuthBypass(t *testing.T) {
 		{http.MethodDelete, "/api/v1/libraries/" + itoa(libID)},
 		{http.MethodPost, "/api/v1/libraries/" + itoa(libID) + "/scan"},
 		{http.MethodGet, "/api/v1/libraries/" + itoa(libID) + "/scans"},
+		{http.MethodPost, "/api/v1/libraries/" + itoa(libID) + "/upload"},
+		{http.MethodPost, "/api/v1/libraries/" + itoa(libID) + "/import"},
+		{http.MethodGet, "/api/v1/imports/1"},
+		{http.MethodDelete, "/api/v1/imports/1"},
+		{http.MethodGet, "/api/v1/me/imports"},
 		{http.MethodGet, "/api/v1/items"},
 		{http.MethodGet, "/api/v1/items/" + itoa(itemID)},
 		{http.MethodPatch, "/api/v1/items/" + itoa(itemID)},
@@ -683,4 +688,186 @@ func TestSecurityRateLimit(t *testing.T) {
 			t.Fatal("repeated setup attempts were never rate limited")
 		}
 	})
+}
+
+// Row: upload permission. Adding books is a permission of its own, not a side
+// effect of being able to read a library.
+func TestSecurityUploadPermission(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	libID := h.createLibraryAt(sid, "Uploads", h.media)
+	book := sampleEPUB(t, "Permission", "A. Writer")
+
+	cases := []struct {
+		name      string
+		role      string
+		canUpload bool
+		want      int
+	}{
+		{"a plain user without the flag", "user", false, http.StatusForbidden},
+		{"a restricted account with the flag set", "restricted", true, http.StatusForbidden},
+		{"a plain user with the flag", "user", true, http.StatusCreated},
+	}
+	for i, c := range cases {
+		userID, userSID := h.makeUser(sid, "u"+itoa(int64(i)), c.role, c.canUpload, []int64{libID})
+
+		upload := h.postUpload(userSID, libID, "", partFile{"book.epub", book})
+		if upload.Code != c.want {
+			t.Errorf("upload by %s = %d, want %d: %s", c.name, upload.Code, c.want, upload.Body.String())
+		}
+		importRec := h.do(http.MethodPost, "/api/v1/libraries/"+itoa(libID)+"/import",
+			map[string]string{"url": "http://books.example.com/one.epub"}, withCookie(userSID))
+		wantImport := http.StatusAccepted
+		if c.want == http.StatusForbidden {
+			wantImport = http.StatusForbidden
+		}
+		if importRec.Code != wantImport {
+			t.Errorf("import by %s = %d, want %d", c.name, importRec.Code, wantImport)
+		}
+
+		// The answer /auth/me gives is the one the frontend hides the button
+		// on, so it has to agree with what the endpoints actually do.
+		me := h.do(http.MethodGet, "/api/v1/auth/me", nil, withCookie(userSID))
+		var identity struct {
+			CanUpload bool `json:"can_upload"`
+		}
+		decode(t, me, &identity)
+		if identity.CanUpload != (c.want == http.StatusCreated) {
+			t.Errorf("/auth/me says can_upload=%v for %s", identity.CanUpload, c.name)
+		}
+
+		// Withdrawing the permission takes effect on the next request.
+		if c.want == http.StatusCreated {
+			patch := h.do(http.MethodPatch, "/api/v1/users/"+itoa(userID),
+				map[string]any{"can_upload": false}, withCookie(sid))
+			if patch.Code != http.StatusOK {
+				t.Fatalf("patch user = %d: %s", patch.Code, patch.Body.String())
+			}
+			again := h.postUpload(userSID, libID, "", partFile{"book.epub", book})
+			if again.Code != http.StatusForbidden {
+				t.Errorf("upload after the permission was withdrawn = %d, want 403", again.Code)
+			}
+		}
+	}
+
+	// Anonymous callers never get as far as the permission check.
+	req := h.postUpload("", libID, "", partFile{"book.epub", book})
+	if req.Code != http.StatusUnauthorized {
+		t.Errorf("anonymous upload = %d, want 401", req.Code)
+	}
+}
+
+// Row: cross-library access, for the add-books routes. A library the caller
+// cannot see answers 404, the same as a library that does not exist.
+func TestSecurityUploadCrossLibrary(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	allowed := h.createLibraryAt(sid, "Theirs", h.media)
+	denied := h.createLibraryAt(sid, "Not theirs", h.otherMe)
+	_, userSID := h.makeUser(sid, "reader", "user", true, []int64{allowed})
+
+	rec := h.postUpload(userSID, denied, "", partFile{"book.epub", sampleEPUB(t, "Elsewhere", "A. Writer")})
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("upload into a library the user cannot see = %d, want 404", rec.Code)
+	}
+	imp := h.do(http.MethodPost, "/api/v1/libraries/"+itoa(denied)+"/import",
+		map[string]string{"url": "http://books.example.com/one.epub"}, withCookie(userSID))
+	if imp.Code != http.StatusNotFound {
+		t.Errorf("import into a library the user cannot see = %d, want 404", imp.Code)
+	}
+	if entries, err := os.ReadDir(h.otherMe); err != nil || len(entries) != 0 {
+		t.Errorf("the refused upload wrote into the other library: %v", entries)
+	}
+}
+
+// Row: path traversal, for uploads. Neither the client's filename nor the
+// subfolder decides where bytes land.
+func TestSecurityUploadTraversal(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	libID := h.createLibraryAt(sid, "Uploads", h.media)
+	book := sampleEPUB(t, "Escape", "A. Writer")
+	outside := filepath.Dir(h.media)
+
+	for _, name := range []string{
+		"../../evil.epub", `..\..\evil.epub`, "/etc/cron.d/evil.epub", "....//....//evil.epub",
+	} {
+		rec := h.postUpload(sid, libID, "", partFile{name, book})
+		if rec.Code != http.StatusCreated && rec.Code != http.StatusConflict {
+			continue // a refusal is also an acceptable answer
+		}
+		if rec.Code == http.StatusCreated {
+			var out uploadResult
+			decode(t, rec, &out)
+			if strings.ContainsAny(out.Files[0].Filename, `/\`) {
+				t.Errorf("filename %q produced the path %q", name, out.Files[0].Filename)
+			}
+		}
+	}
+	for _, subdir := range []string{"..", "../escape", `..\escape`, "a/b", "/etc"} {
+		rec := h.postUpload(sid, libID, subdir, partFile{"book.epub", book})
+		if rec.Code == http.StatusCreated {
+			t.Errorf("subfolder %q was accepted", subdir)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(outside, "evil.epub")); err == nil {
+		t.Fatal("an upload wrote outside the library root")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "escape")); err == nil {
+		t.Fatal("a subfolder escaped the library root")
+	}
+}
+
+// Row: SSRF, for URL imports. The importer is always enabled - the user typed
+// the URL - so the address guard is the only thing standing between it and the
+// server's own network.
+func TestSecurityImportSSRF(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	libID := h.createLibraryAt(sid, "Imports", h.media)
+
+	for _, raw := range []string{
+		"http://127.0.0.1/book.epub", "http://[::1]/book.epub", "http://10.0.0.1/book.epub",
+		"http://192.168.0.1/book.epub", "http://172.20.0.1/book.epub",
+		"http://169.254.169.254/latest/meta-data/", "http://0.0.0.0/book.epub",
+	} {
+		rec := h.do(http.MethodPost, "/api/v1/libraries/"+itoa(libID)+"/import",
+			map[string]string{"url": raw}, withCookie(sid))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("import of %q = %d, want 400: %s", raw, rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), raw) {
+			t.Errorf("the refusal for %q echoed the address back", raw)
+		}
+	}
+	// Nothing was queued, so nothing will be fetched later either.
+	list := h.do(http.MethodGet, "/api/v1/me/imports", nil, withCookie(sid))
+	var jobs struct {
+		Total int `json:"total"`
+	}
+	decode(t, list, &jobs)
+	if jobs.Total != 0 {
+		t.Errorf("%d refused imports were queued anyway", jobs.Total)
+	}
+}
+
+// Row: rate limit, for uploads. One account cannot hold several 2 GiB streams
+// open at once, and cannot start an unbounded number of them.
+func TestSecurityUploadRateLimit(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	libID := h.createLibraryAt(sid, "Uploads", h.media)
+
+	limited := false
+	for i := 0; i < 60; i++ {
+		rec := h.postUpload(sid, libID, "", partFile{"book.epub",
+			sampleEPUB(t, "Book "+itoa(int64(i)), "A. Writer")})
+		if rec.Code == http.StatusTooManyRequests {
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Error("uploads from one account were never rate limited")
+	}
 }

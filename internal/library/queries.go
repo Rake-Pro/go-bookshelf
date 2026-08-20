@@ -537,7 +537,7 @@ type Settings struct {
 func DefaultSettings() Settings {
 	return Settings{
 		Reader: ReaderSettings{
-			FontScale: 1.0, FontFamily: "publisher", LineHeight: 1.5,
+			FontScale: 1.15, FontFamily: "publisher", LineHeight: 1.6,
 			LetterSpacing: 0, WordSpacing: 0, ParagraphSpacing: 0,
 			Margin: "normal", Align: "publisher", Theme: "light",
 			CustomFG: "#1f1d1a", CustomBG: "#faf8f4",
@@ -553,7 +553,7 @@ func DefaultSettings() Settings {
 func (s *Settings) Normalize() {
 	d := DefaultSettings()
 
-	s.Reader.FontScale = quantize(s.Reader.FontScale, 0.7, 2.5, 0.1, d.Reader.FontScale)
+	s.Reader.FontScale = quantize(s.Reader.FontScale, 0.7, 2.5, 0.05, d.Reader.FontScale)
 	s.Reader.LineHeight = clampFloat(s.Reader.LineHeight, 1.0, 3.0, d.Reader.LineHeight)
 	s.Reader.LetterSpacing = clampFloat(s.Reader.LetterSpacing, -0.1, 1.0, 0)
 	s.Reader.WordSpacing = clampFloat(s.Reader.WordSpacing, -0.1, 2.0, 0)
@@ -561,7 +561,7 @@ func (s *Settings) Normalize() {
 	s.Reader.FontFamily = oneOf(s.Reader.FontFamily, d.Reader.FontFamily, "publisher", "system", "serif", "sans", "dyslexic")
 	s.Reader.Margin = oneOf(s.Reader.Margin, d.Reader.Margin, "narrow", "normal", "wide")
 	s.Reader.Align = oneOf(s.Reader.Align, d.Reader.Align, "publisher", "left", "justify")
-	s.Reader.Theme = oneOf(s.Reader.Theme, d.Reader.Theme, "light", "dark", "sepia", "hc-dark", "hc-light", "custom")
+	s.Reader.Theme = oneOf(s.Reader.Theme, d.Reader.Theme, "light", "dark", "sepia", "gray", "hc-dark", "hc-light", "custom")
 	s.Reader.Layout = oneOf(s.Reader.Layout, d.Reader.Layout, "paginated", "scrolled")
 	s.Reader.Columns = oneOf(s.Reader.Columns, d.Reader.Columns, "auto", "1", "2")
 	s.Reader.CustomFG = hexColor(s.Reader.CustomFG, d.Reader.CustomFG)

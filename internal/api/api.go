@@ -14,13 +14,16 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rake-pro/go-bookshelf/internal/auth"
 	"github.com/rake-pro/go-bookshelf/internal/config"
 	"github.com/rake-pro/go-bookshelf/internal/images"
+	"github.com/rake-pro/go-bookshelf/internal/importer"
 	"github.com/rake-pro/go-bookshelf/internal/library"
 	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
+	"github.com/rake-pro/go-bookshelf/internal/upload"
 	"github.com/rs/zerolog/log"
 )
 
@@ -34,14 +37,30 @@ type API struct {
 	scanner  *library.Scanner
 	covers   *images.Store
 	version  string
+
+	// Adding books. The upload service is the only thing in the server that
+	// writes into a library; the job queue and its worker are how a URL import
+	// outlives the request that asked for it.
+	uploads       *upload.Service
+	jobs          *importer.Jobs
+	importWorker  *importer.Worker
+	uploadLimiter *auth.Limiter
+	uploading     *inflight
 }
 
 // New builds the API handler set.
 func New(cfg config.Config, set *settings.Service, db *store.DB, cat *library.Catalog,
-	authMgr *auth.Manager, scanner *library.Scanner, covers *images.Store, version string) *API {
+	authMgr *auth.Manager, scanner *library.Scanner, covers *images.Store, version string,
+	uploads *upload.Service, jobs *importer.Jobs, worker *importer.Worker) *API {
 	return &API{
 		cfg: cfg, settings: set, db: db, cat: cat, auth: authMgr,
 		scanner: scanner, covers: covers, version: version,
+		uploads: uploads, jobs: jobs, importWorker: worker,
+		// Thirty uploads of burst, then one more every two seconds: enough to
+		// drop a folder of chapters in at once, not enough to be a way of
+		// filling a disk.
+		uploadLimiter: auth.NewLimiter(30, 2*time.Second),
+		uploading:     newInflight(),
 	}
 }
 
@@ -231,6 +250,12 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH "+p+"/libraries/{id}", a.patchLibrary)
 	mux.HandleFunc("DELETE "+p+"/libraries/{id}", a.deleteLibrary)
 	mux.HandleFunc("POST "+p+"/libraries/{id}/scan", a.scanLibrary)
+	// Adding books. Both routes need the upload permission rather than the
+	// admin role, and both are checked against the caller's library access.
+	mux.HandleFunc("POST "+p+"/libraries/{id}/upload", a.uploadFiles)
+	mux.HandleFunc("POST "+p+"/libraries/{id}/import", a.createImport)
+	mux.HandleFunc("GET "+p+"/imports/{id}", a.getImport)
+	mux.HandleFunc("DELETE "+p+"/imports/{id}", a.deleteImport)
 	mux.HandleFunc("GET "+p+"/libraries/{id}/scans", a.listScans)
 
 	// Items.
@@ -260,6 +285,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+p+"/me/bookmarks", a.listBookmarks)
 	mux.HandleFunc("POST "+p+"/me/bookmarks", a.createBookmark)
 	mux.HandleFunc("DELETE "+p+"/me/bookmarks/{id}", a.deleteBookmark)
+	mux.HandleFunc("GET "+p+"/me/imports", a.listImports)
 	mux.HandleFunc("GET "+p+"/me/tokens", a.listTokens)
 	mux.HandleFunc("POST "+p+"/me/tokens", a.createToken)
 	mux.HandleFunc("DELETE "+p+"/me/tokens/{id}", a.deleteToken)

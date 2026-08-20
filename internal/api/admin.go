@@ -36,6 +36,7 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 		DisplayName string  `json:"display_name"`
 		Role        string  `json:"role"`
 		Libraries   []int64 `json:"libraries"`
+		CanUpload   bool    `json:"can_upload"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -58,6 +59,17 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if body.CanUpload {
+		if err := a.auth.SetCanUpload(r.Context(), user.ID, true); err != nil {
+			fail(w, err, "upload permission")
+			return
+		}
+		user, err = a.auth.UserByID(r.Context(), user.ID)
+		if err != nil {
+			fail(w, err, "upload permission")
+			return
+		}
+	}
 	log.Info().Str("username", user.Username).Str("role", user.Role).Msg("account created")
 	writeJSON(w, http.StatusCreated, user)
 }
@@ -77,6 +89,7 @@ func (a *API) patchUser(w http.ResponseWriter, r *http.Request) {
 		Role        *string `json:"role"`
 		Password    *string `json:"password"`
 		Disabled    *bool   `json:"disabled"`
+		CanUpload   *bool   `json:"can_upload"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -109,6 +122,12 @@ func (a *API) patchUser(w http.ResponseWriter, r *http.Request) {
 	if body.Password != nil {
 		if err := a.auth.SetPassword(r.Context(), userID, *body.Password); err != nil {
 			writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
+			return
+		}
+	}
+	if body.CanUpload != nil {
+		if err := a.auth.SetCanUpload(r.Context(), userID, *body.CanUpload); err != nil {
+			fail(w, err, "upload permission")
 			return
 		}
 	}

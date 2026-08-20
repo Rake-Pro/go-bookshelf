@@ -102,7 +102,14 @@ func EPUBBytes(o EPUBOptions) ([]byte, error) {
 		return err
 	}
 
-	if err := add("mimetype", []byte("application/epub+zip")); err != nil {
+	// The mimetype entry has to be the archive's first, stored uncompressed:
+	// that is what lets a reader identify an EPUB from its leading bytes, and
+	// the upload path checks for it.
+	mimetype, err := zw.CreateHeader(&zip.FileHeader{Name: "mimetype", Method: zip.Store})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := mimetype.Write([]byte("application/epub+zip")); err != nil {
 		return nil, err
 	}
 	if !o.OmitContainer {
