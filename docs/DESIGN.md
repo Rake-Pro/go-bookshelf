@@ -158,7 +158,8 @@ item_series(item_id, series_id, sequence REAL)
 tags(id, name UNIQUE)            item_tags(item_id, tag_id)
 collections(id, user_id NULL, name)   collection_items(collection_id, item_id, seq)
 users(id, username UNIQUE, display_name, password_hash NULL, oidc_subject NULL,
-      role CHECK(role IN ('admin','user','restricted')), created_at, disabled_at)
+      role CHECK(role IN ('admin','user','restricted')), created_at, disabled_at,
+      can_upload INTEGER NOT NULL DEFAULT 0)
 user_library_access(user_id, library_id)
 user_settings(user_id PRIMARY KEY, reader_json, player_json, ui_json, updated_at)
 progress(user_id, item_id, locator, position_ms, percent REAL, finished_at NULL,
@@ -173,7 +174,21 @@ progress_archive(user_id, library_id, source_key, locator, position_ms, percent,
                  finished_at NULL, device, archived_at, PRIMARY KEY(user_id, library_id, source_key))
 cover_images(item_id, variant CHECK(variant IN ('thumb','full')), content_type,
              bytes, updated_at, PRIMARY KEY(item_id, variant))
+import_jobs(id, user_id, library_id, url,
+            status CHECK(status IN ('queued','running','done','failed')),
+            message, item_id NULL, created_at, updated_at)
 ```
+
+`users.can_upload` is a per-account flag rather than a role, because "may add
+books" and "may administer the server" are different powers. An administrator
+always may and the `restricted` role never may, so the column decides only the
+case in between; it defaults to 0, so an upgrade grants nobody anything.
+
+`import_jobs` is the queue behind URL imports. The row is the only thing the
+client and the worker share: the client polls it, the worker advances it, and a
+cancel deletes it - which the worker notices between steps and stops. There is
+deliberately no `cancelled` status, so there is exactly one place the answer to
+"is this job still wanted" lives.
 
 Cover artwork is rows, not files. The scan that ingests a book re-encodes
 whatever artwork it carried into two bounded JPEGs - a thumbnail at most 400px
@@ -253,6 +268,80 @@ position across the concatenated file sequence for audiobooks.
   uncompressed <= 2 GiB, no absolute paths, no `..`, no symlinks followed,
   images resized with a 100 MP pixel cap and 10 s timeout.
 
+## Adding books
+
+`internal/upload` is the only code in the server that writes into a library
+directory, and both ways in - an upload from the browser and a URL import - end
+there. Nothing reaches a library until it has been parsed by the same reader
+the scanner uses.
+
+The order of operations is the design:
+
+1. **Stage.** The bytes are streamed into `<library root>/.gbs-incoming`, a
+   dot-directory the scanner's walk skips, so a half-written or rejected file is
+   never a candidate for ingest. The write is capped as it goes: 200 MiB for an
+   EPUB, 2 GiB for an audio file. Nothing is buffered in memory.
+2. **Check the extension** against what the library's kind accepts - `ebook`
+   takes `.epub`, `audiobook` takes `.m4b`, `.m4a`, `.mp3`, `mixed` takes all
+   four. `.mp4` is deliberately absent: the scanner reads it, but accepting an
+   upload of it invites a video file.
+3. **Check the magic bytes**, which is where an extension stops being evidence.
+   EPUB: the zip local header, then a `mimetype` entry holding exactly
+   `application/epub+zip`. The specification also requires that entry to be
+   first and stored uncompressed; plenty of real books break that while being
+   otherwise valid, so a deviation is accepted and logged rather than refused.
+   MP4: an `ftyp` box at offset 4 with brand `M4A `, `M4B `, `mp42` or `isom`.
+   MP3: an ID3v2 tag, or an MPEG frame header - all four reserved bit patterns
+   checked - within the first 64 KiB.
+4. **Parse** with `epub.Open` or `audio.Probe`, which applies the archive limits
+   above. An upload that is accepted here is one the scanner can ingest.
+5. **Deduplicate** on the SHA-1 of the bytes against `files.sha1`, server-wide.
+   The same book saved twice under two names is one book; the answer is 409
+   naming the existing item.
+6. **Name it.** The client's filename never reaches the filesystem: it is read
+   for its extension and kept only as a last-resort label. An ebook becomes
+   `<Author> - <Title>.epub`; audio files become
+   `<Author> - <Title>/<NN> - <chapter>.ext`, with several files of one book
+   grouped into one directory when their album and author tags agree - which is
+   what makes them one item rather than several. Names are ASCII-folded,
+   stripped of everything a filesystem reserves, length-capped and suffixed
+   ` (2)`, ` (3)` on a collision. An optional `subdir` is one plain name, never
+   a path.
+7. **Rename into place**, after an `fsync`, from the staging directory in the
+   same library root - so the rename is atomic even on NFS - and flush the
+   directory entry. Then an incremental scan of that library runs, and the ids
+   of the items it produced are returned.
+
+Uploads are rate limited per account (30 of burst, then one every two seconds)
+and one upload at a time per account, so a 2 GiB cap cannot be multiplied by
+however many requests a browser will open.
+
+### URL imports
+
+A URL is fetched through `internal/remote`, so the SSRF guard applies to it and
+to everything it leads to. What it turns out to be is decided by the bytes, not
+by the URL's extension or the server's `Content-Type`:
+
+- **A book file** is streamed straight into the validation path above.
+- **An HTML page** goes to the web-story importer: title and author from
+  `og:title`, schema.org `Book`/`Article` JSON-LD, `<title>` or a byline; the
+  body chosen by a readability-style scorer that weights paragraph text and
+  class names and discounts link density; then sanitized to an allowlist of
+  elements and attributes - no scripts, styles, iframes, forms, navigation,
+  footers or anything whose class marks it as an ad, a share bar or a comment
+  thread. Links are unwrapped to their text. Images are re-fetched through the
+  guard, checked by magic bytes, capped and embedded. `rel="next"` links, and
+  anchors that say "next" or name the following chapter, are followed on the
+  same host only, at one request a second, up to 2,000 chapters. The result is
+  built into an EPUB 3 - OPF, nav document, one XHTML file per chapter - and
+  handed to the upload validation path, because building it here is no reason
+  to trust it.
+
+Per-site adapters implement `importer.Site` (`Match(url) bool`,
+`Book(ctx, url) (*Book, error)`) and register a factory that receives the
+guarded fetcher. The generic extractor is the fallback, so an adapter can be
+added without touching the pipeline.
+
 ## HTTP API (`/api/v1`)
 
 All JSON. Auth via session cookie (`gbs_session`, HttpOnly, SameSite=Lax) or
@@ -331,6 +420,23 @@ Libraries (admin for writes)
 - `GET /libraries`; `POST /libraries` `{name, kind, paths:[]}`; `PATCH /libraries/{id}`; `DELETE /libraries/{id}`
 - `POST /libraries/{id}/scan` -> `{scan_id}`; `GET /libraries/{id}/scans`
 
+Adding books (needs `can_upload`; admins always have it, `restricted` never
+does, and the library must be one the caller can see or the answer is 404)
+- `POST /libraries/{id}/upload` `multipart/form-data`: one or more `files`
+  parts and an optional `subdir` field, which must precede them because the
+  request is streamed (or be given as `?subdir=`). Answers 201
+  `{status:"complete", files:[{filename, kind, title, author, size_bytes,
+  item_id}]}`, or 202 with `status:"scanning"` when the scan that follows is
+  still running and the ids are not ready. 409 carries `item_id` and `title`
+  alongside the error envelope; 413 with code `too_large` is the size cap.
+- `POST /libraries/{id}/import` `{url}` -> 202 with the job. Refuses a
+  non-http(s) scheme or a literal private address immediately, so nothing is
+  queued that could never run.
+- `GET /me/imports` -> the caller's jobs, newest first; an administrator sees
+  every account's, which is what makes the queue diagnosable.
+- `GET /imports/{id}`, `DELETE /imports/{id}` (cancel a queued or running job,
+  or clear a finished one). Somebody else's job answers 404, not 403.
+
 Items
 - `GET /items?library=&kind=&author=&series=&tag=&q=&sort=added|title|author|recent`
 - `GET /items/{id}` -> item + people + series + tags + files + chapters + progress.
@@ -371,9 +477,12 @@ User state
 - `GET /me/progress?since=` ; `PUT /me/progress/{item_id}` `{locator?, position_ms?, percent, finished?, device}`
 - `GET|POST /me/bookmarks?item=` ; `DELETE /me/bookmarks/{id}`
 - `GET|POST /me/tokens` ; `DELETE /me/tokens/{id}`
+- `GET /me/imports` -> the import queue; see "Adding books" above
 
 Admin
-- `GET|POST /users`, `PATCH /users/{id}`, `DELETE /users/{id}`, `PUT /users/{id}/libraries`
+- `GET|POST /users`, `PATCH /users/{id}`, `DELETE /users/{id}`, `PUT /users/{id}/libraries`.
+  Both `POST` and `PATCH` take `can_upload`; `GET /auth/me` answers `can_upload`
+  with the role already folded in, so the frontend never reimplements the rule.
 - `GET /system/status` -> `{version, go_version, db_path, db_size_bytes, data_dir,
   counts:{ebooks,audiobooks}, libraries, users, last_scans, oidc_enabled,
   local_login, settings_updated_at, base_url, time}`
@@ -396,13 +505,13 @@ stylesheet from the parent, not by rewriting the book.
 ## Reader settings (`user_settings.reader_json`)
 
 ```json
-{"font_scale":1.0,"font_family":"publisher|system|serif|sans|dyslexic",
- "line_height":1.5,"letter_spacing":0,"word_spacing":0,"paragraph_spacing":0,
+{"font_scale":1.15,"font_family":"publisher|system|serif|sans|dyslexic",
+ "line_height":1.6,"letter_spacing":0,"word_spacing":0,"paragraph_spacing":0,
  "margin":"narrow|normal|wide","align":"publisher|left|justify",
- "theme":"light|dark|sepia|hc-dark|hc-light|custom","custom_fg":"#1f1d1a","custom_bg":"#faf8f4",
+ "theme":"light|sepia|gray|dark|hc-dark|hc-light|custom","custom_fg":"#1f1d1a","custom_bg":"#faf8f4",
  "layout":"paginated|scrolled","columns":"auto|1|2"}
 ```
-`font_scale` range 0.7-2.5 in 0.1 steps. App chrome uses `rem` everywhere and
+`font_scale` range 0.7-2.5 in 0.05 steps. App chrome uses `rem` everywhere and
 never sets a px root font size so OS text scaling applies.
 
 ## Player settings (`player_json`)
@@ -462,6 +571,13 @@ scaling still compounds on top of it.
 | Lockout | the password form cannot be turned off while OIDC is off, nor while no administrator could sign in through it; `GOBOOKSHELF_ADMIN_RECOVERY` is environment-only |
 | SSO group mapping | an identity in neither configured group is refused and creates no account |
 | Setup token | spendable exactly once even under concurrent requests, so the wizard can only ever create one administrator; a rejected account hands the token back |
+| Upload permission | a plain user without `can_upload`, and a `restricted` account with it set, are both refused on upload and import; the flag grants both; withdrawing it takes effect on the next request; `/auth/me` agrees with what the endpoints do |
+| Upload validation | wrong extension for the library kind, magic bytes that do not match the extension, a zip that is not an EPUB, an archive over the entry limit, an empty file and a file over the size cap are each refused, and none of them leaves anything behind - staging directory included |
+| Upload naming | the client's filename is read for its extension only: a traversal in it cannot produce a path, and a `subdir` that is a path, `..`, or absolute is refused |
+| Upload duplication | the same bytes twice answers 409 naming the existing item, whether in one request or two |
+| Upload rate limit | uploads are limited per account, and only one is accepted at a time from one account |
+| Import SSRF | a URL import refuses loopback, private, link-local and carrier-grade-NAT addresses and any non-http(s) scheme before a job is queued, and never echoes the address back; a chapter walk never leaves the starting host |
+| Cross-library upload | uploading or importing into a library the caller cannot see answers 404 and writes nothing into it |
 
 ## Milestones
 

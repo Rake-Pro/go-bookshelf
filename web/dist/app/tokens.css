@@ -136,15 +136,61 @@
 }
 
 /* Reader surface tokens. The reader sets data-reader-theme on <html>; these
-   feed both the reader chrome and the stylesheet injected into the book. */
+   feed both the reader chrome and the stylesheet injected into the book, so a
+   dark page never sits inside a light frame. The same numbers exist once more
+   in app/epub.js (READER_PALETTES), which cannot read this file from inside the
+   book iframe - change both together. */
 :root {
   --reader-bg: var(--bg);
   --reader-fg: var(--text);
   --reader-link: var(--accent);
+  --reader-sel: var(--surface-2);
+  --reader-chrome: var(--surface);
+  --reader-border: var(--border);
+  --reader-muted: var(--muted);
 }
-:root[data-reader-theme="light"]   { --reader-bg: #faf8f4; --reader-fg: #1f1d1a; --reader-link: #c2561f; }
-:root[data-reader-theme="dark"]    { --reader-bg: #141210; --reader-fg: #ece7df; --reader-link: #e8834f; }
-:root[data-reader-theme="sepia"]   { --reader-bg: #f4ecd8; --reader-fg: #5b4636; --reader-link: #8c4a1f; }
-:root[data-reader-theme="hc-light"]{ --reader-bg: #ffffff; --reader-fg: #000000; --reader-link: #0043a8; }
-:root[data-reader-theme="hc-dark"] { --reader-bg: #000000; --reader-fg: #ffffff; --reader-link: #ffd400; }
-:root[data-reader-theme="custom"]  { --reader-bg: var(--custom-bg, #faf8f4); --reader-fg: var(--custom-fg, #1f1d1a); --reader-link: var(--accent); }
+:root[data-reader-theme="light"] {
+  --reader-bg: #faf8f4; --reader-fg: #1f1d1a; --reader-link: #b04a17;
+  --reader-sel: #f0d8b4; --reader-chrome: #fffdf8; --reader-border: #e2dbd0;
+  --reader-muted: #6b655d;
+}
+:root[data-reader-theme="sepia"] {
+  --reader-bg: #f4ecd8; --reader-fg: #4a3a29; --reader-link: #8c4a1f;
+  --reader-sel: #e3cfa4; --reader-chrome: #faf3e2; --reader-border: #ddd0b4;
+  --reader-muted: #7a6851;
+}
+:root[data-reader-theme="gray"] {
+  --reader-bg: #cbc7c0; --reader-fg: #1c1a18; --reader-link: #7a3d16;
+  --reader-sel: #b0aba2; --reader-chrome: #d5d1cb; --reader-border: #b2aea6;
+  --reader-muted: #4f4b45;
+}
+:root[data-reader-theme="dark"] {
+  --reader-bg: #0b0b0c; --reader-fg: #cfc9c0; --reader-link: #e8a06a;
+  --reader-sel: #3a352d; --reader-chrome: #171718; --reader-border: #2c2b2a;
+  --reader-muted: #8d867d;
+}
+:root[data-reader-theme="hc-light"] {
+  --reader-bg: #ffffff; --reader-fg: #000000; --reader-link: #0043a8;
+  --reader-sel: #ffe680; --reader-chrome: #ffffff; --reader-border: #000000;
+  --reader-muted: #000000;
+}
+:root[data-reader-theme="hc-dark"] {
+  --reader-bg: #000000; --reader-fg: #ffffff; --reader-link: #ffd400;
+  --reader-sel: #4d4000; --reader-chrome: #000000; --reader-border: #ffffff;
+  --reader-muted: #ffffff;
+}
+/* Custom is two user-picked colors; the rest of the palette is mixed from them
+   (the plain declarations are the fallback where color-mix is unsupported). */
+:root[data-reader-theme="custom"] {
+  --reader-bg: var(--custom-bg, #faf8f4);
+  --reader-fg: var(--custom-fg, #1f1d1a);
+  --reader-link: var(--custom-fg, #1f1d1a);
+  --reader-sel: var(--custom-bg, #faf8f4);
+  --reader-chrome: var(--custom-bg, #faf8f4);
+  --reader-border: var(--custom-fg, #1f1d1a);
+  --reader-muted: var(--custom-fg, #1f1d1a);
+  --reader-sel: color-mix(in srgb, var(--custom-fg) 22%, var(--custom-bg));
+  --reader-chrome: color-mix(in srgb, var(--custom-fg) 8%, var(--custom-bg));
+  --reader-border: color-mix(in srgb, var(--custom-fg) 28%, var(--custom-bg));
+  --reader-muted: color-mix(in srgb, var(--custom-fg) 72%, var(--custom-bg));
+}

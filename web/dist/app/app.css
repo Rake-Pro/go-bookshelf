@@ -89,6 +89,9 @@ a:hover { text-decoration-thickness: 2px; }
 }
 .iconbtn:hover { background: var(--surface-2); }
 .iconbtn svg { width: 1.5rem; height: 1.5rem; }
+/* Inline icons inside text buttons/links: never let an SVG take its container's width. */
+.btn svg { width: 1.25rem; height: 1.25rem; flex: 0 0 auto; }
+svg:not([width]):not([height]) { max-width: 100%; }
 .iconbtn[aria-pressed="true"] { background: var(--surface-2); border-color: var(--border); }
 
 .field { display: block; margin-bottom: var(--s4); }
@@ -345,7 +348,9 @@ main.content {
 .section-head:first-child { margin-top: 0; }
 
 .linklist { list-style: none; margin: 0; padding: 0; }
-.linklist a, .linklist button {
+/* A .btn inside a link list keeps being a button: without the exclusion the
+   list's own row styling wins on specificity and stretches it across the row. */
+.linklist a:not(.btn), .linklist button:not(.btn) {
   display: flex;
   align-items: center;
   gap: var(--s3);
@@ -361,7 +366,7 @@ main.content {
   font: inherit;
   cursor: pointer;
 }
-.linklist a:hover, .linklist button:hover { background: var(--surface-2); }
+.linklist a:not(.btn):hover, .linklist button:not(.btn):hover { background: var(--surface-2); }
 .linklist [aria-current="true"] { background: var(--surface-2); box-shadow: inset 3px 0 0 0 var(--accent); }
 
 /* ---------- item detail ---------- */

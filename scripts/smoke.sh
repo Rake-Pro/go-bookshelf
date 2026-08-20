@@ -17,7 +17,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="$(mktemp -d)"
 port="${SMOKE_PORT:-18080}"
 base="http://127.0.0.1:${port}"
+# The URL import needs somewhere on this machine to fetch from; gen-samples
+# doubles as that file server.
+files_port="$((port + 1))"
+files_base="http://127.0.0.1:${files_port}"
 server_pid=""
+files_pid=""
 driver="sqlite"
 
 while [ $# -gt 0 ]; do
@@ -52,10 +57,12 @@ case "${driver}" in
 esac
 
 cleanup() {
-  if [ -n "${server_pid}" ] && kill -0 "${server_pid}" 2>/dev/null; then
-    kill "${server_pid}" 2>/dev/null || true
-    wait "${server_pid}" 2>/dev/null || true
-  fi
+  for pid in "${server_pid}" "${files_pid}"; do
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+    fi
+  done
   rm -rf "${work}"
 }
 trap cleanup EXIT
@@ -71,7 +78,20 @@ mkdir -p "${repo_root}/bin"
 go build -o "${binary}" ./cmd/go-bookshelf
 
 step "generating a sample library"
-go run ./scripts/gen-samples -dir "${work}/media"
+# Built rather than "go run": the file server below has to be killable by pid,
+# and "go run" would leave its child behind.
+samples="${repo_root}/bin/gen-samples"
+go build -o "${samples}" ./scripts/gen-samples
+"${samples}" -dir "${work}/media" -inbox "${work}/inbox"
+
+step "starting a file server on ${files_base} for the URL import"
+"${samples}" -inbox "${work}/inbox" -serve "127.0.0.1:${files_port}" >"${work}/files.log" 2>&1 &
+files_pid=$!
+for _ in $(seq 1 100); do
+  if curl -fsS "${files_base}/morning.epub" -o /dev/null 2>/dev/null; then break; fi
+  sleep 0.1
+done
+curl -fsS "${files_base}/morning.epub" -o /dev/null || fail "the sample file server never came up"
 
 step "generating a secrets key"
 # The key encrypts the credentials the app stores in its own database. There is
@@ -401,6 +421,116 @@ secret="$(json_field "${token_body}" secret)"
 opds_code="$(curl -s -o /dev/null -w '%{http_code}' "${base}/opds")"
 [ "${opds_code}" = "401" ] || fail "anonymous /opds returned ${opds_code}, want 401"
 curl -fsS -u "smoke:${secret}" "${base}/opds" | grep -q '<feed' || fail "/opds did not return a feed"
+
+# ---------------------------------------------------------------------------
+# Adding books: an upload from this machine, and an import from a URL. Both end
+# in the same validation path, so both are worth driving end to end.
+# ---------------------------------------------------------------------------
+
+step "POST /api/v1/libraries/${library_id}/upload"
+upload="$(curl -fsS -b "${jar}" -X POST "${base}/api/v1/libraries/${library_id}/upload" \
+  -F "files=@${work}/inbox/morning.epub")"
+echo "${upload}"
+echo "${upload}" | grep -q '"status":"complete"' || fail "the upload did not finish"
+echo "${upload}" | grep -q '"filename":"A. Writer - The Long Morning.epub"' \
+  || fail "the uploaded book was not filed under a name derived from its metadata"
+uploaded_item="$(echo "${upload}" | sed -n 's/.*"item_id":\([0-9]*\).*/\1/p' | head -1)"
+[ -n "${uploaded_item}" ] && [ "${uploaded_item}" != "0" ] \
+  || fail "the upload response carries no item id"
+[ -f "${work}/media/A. Writer - The Long Morning.epub" ] \
+  || fail "the uploaded file is not in the library directory"
+curl -fsS -b "${jar}" "${base}/api/v1/items/${uploaded_item}" | grep -q '"title":"The Long Morning"' \
+  || fail "the uploaded book was not ingested by the scan that followed"
+
+step "the client's filename never decides the name on disk"
+# The name in the request is a traversal; the name on disk comes from the
+# book's own metadata, so the traversal is not so much refused as irrelevant.
+named="$(curl -fsS -b "${jar}" -X POST "${base}/api/v1/libraries/${library_id}/upload" \
+  -F "files=@${work}/inbox/dusk.epub;filename=../../evil.epub")"
+echo "${named}"
+echo "${named}" | grep -q '"filename":"A. Writer - The Long Dusk.epub"' \
+  || fail "a traversal in the client's filename reached the on-disk name"
+[ ! -e "${work}/evil.epub" ] || fail "an upload wrote outside the library"
+
+step "a subfolder that is a path is refused"
+traversal="$(curl -s -o /dev/null -w '%{http_code}' -b "${jar}" \
+  -X POST "${base}/api/v1/libraries/${library_id}/upload" \
+  -F "subdir=../escape" -F "files=@${work}/inbox/dusk.epub")"
+[ "${traversal}" = "400" ] || fail "a traversal in the subfolder returned ${traversal}, want 400"
+[ ! -e "${work}/escape" ] || fail "an upload created a directory outside the library"
+
+step "an upload whose bytes are not a book is refused"
+badmagic="$(curl -s -o /dev/null -w '%{http_code}' -b "${jar}" \
+  -X POST "${base}/api/v1/libraries/${library_id}/upload" \
+  -F "files=@${work}/inbox/not-a-book.epub")"
+[ "${badmagic}" = "400" ] || fail "a text file called .epub returned ${badmagic}, want 400"
+
+step "the same book twice is refused as a duplicate"
+dup_body="${work}/dup.json"
+dup="$(curl -s -o "${dup_body}" -w '%{http_code}' -b "${jar}" \
+  -X POST "${base}/api/v1/libraries/${library_id}/upload" \
+  -F "files=@${work}/inbox/morning.epub")"
+[ "${dup}" = "409" ] || fail "a duplicate upload returned ${dup}, want 409"
+grep -q "\"item_id\":${uploaded_item}" "${dup_body}" \
+  || { cat "${dup_body}"; fail "the conflict does not name the book already in the library"; }
+
+step "URL imports refuse a private address before anything is queued"
+for blocked in "http://169.254.169.254/latest/meta-data/" "file:///etc/passwd"; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' -b "${jar}" \
+    -X POST "${base}/api/v1/libraries/${library_id}/import" \
+    -H 'Content-Type: application/json' -d "{\"url\":\"${blocked}\"}")"
+  [ "${code}" = "400" ] || fail "importing ${blocked} returned ${code}, want 400"
+done
+
+step "allowing the guarded fetcher to reach this machine"
+# The file server is on the loopback address, which the SSRF guard refuses by
+# default. This is the same switch an operator flips for a metadata provider on
+# their own network, and it is what makes the next step reachable at all.
+curl -fsS -b "${jar}" -X PUT "${base}/api/v1/admin/settings" \
+  -H 'Content-Type: application/json' -d '{"metadata":{"provider":"none","allow_private":true}}' \
+  >/dev/null || fail "could not allow private addresses"
+
+step "POST /api/v1/libraries/{id}/import"
+mkdir -p "${work}/imports"
+import_lib="$(curl -fsS -b "${jar}" -X POST "${base}/api/v1/libraries" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Imports\",\"kind\":\"mixed\",\"paths\":[\"${work}/imports\"]}")"
+import_lib_id="$(echo "${import_lib}" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)"
+[ -n "${import_lib_id}" ] || fail "could not create the import library"
+
+job="$(curl -fsS -b "${jar}" -X POST "${base}/api/v1/libraries/${import_lib_id}/import" \
+  -H 'Content-Type: application/json' -d "{\"url\":\"${files_base}/noon.epub\"}")"
+echo "${job}"
+job_id="$(echo "${job}" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)"
+[ -n "${job_id}" ] || fail "the import was not queued"
+echo "${job}" | grep -q '"status":"queued"' || fail "a new import is not queued"
+
+step "waiting for import ${job_id}"
+import_status=""
+for _ in $(seq 1 300); do
+  job="$(curl -fsS -b "${jar}" "${base}/api/v1/imports/${job_id}")"
+  case "${job}" in
+    *'"status":"done"'*) import_status="done"; break ;;
+    *'"status":"failed"'*) echo "${job}"; fail "the import failed" ;;
+  esac
+  sleep 0.2
+done
+[ "${import_status}" = "done" ] || { echo "${job}"; fail "the import never finished"; }
+echo "${job}"
+import_item="$(echo "${job}" | sed -n 's/.*"item_id":\([0-9]*\).*/\1/p' | head -1)"
+[ -n "${import_item}" ] && [ "${import_item}" != "0" ] || fail "the finished import names no item"
+curl -fsS -b "${jar}" "${base}/api/v1/items/${import_item}" | grep -q '"title":"The Long Noon"' \
+  || fail "the imported book is not in the catalog"
+[ -f "${work}/imports/A. Writer - The Long Noon.epub" ] \
+  || fail "the imported book is not in the import library's directory"
+
+step "GET /api/v1/me/imports"
+curl -fsS -b "${jar}" "${base}/api/v1/me/imports" | grep -q "\"id\":${job_id}" \
+  || fail "the import is missing from the job list"
+
+step "DELETE /api/v1/imports/${job_id}"
+curl -fsS -b "${jar}" -X DELETE "${base}/api/v1/imports/${job_id}" | grep -q '"status":"cancelled"' \
+  || fail "the finished import could not be cleared"
 
 step "SPA fallback"
 for route in / /library/1 /item/1 /read/1 /listen/1 /authors /series /search /settings /admin /admin/settings /login /setup; do

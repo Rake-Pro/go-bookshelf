@@ -18,6 +18,9 @@ type meResponse struct {
 	Role        string  `json:"role"`
 	Libraries   []int64 `json:"libraries"`
 	AuthMethod  string  `json:"auth_method"`
+	// CanUpload is the answer to "may this account add books", with the role
+	// already folded in, so the frontend never has to reimplement the rule.
+	CanUpload bool `json:"can_upload"`
 }
 
 // authStatus tells the login page and the wizard what they may offer. It is
@@ -106,6 +109,7 @@ func (a *API) writeMe(w http.ResponseWriter, r *http.Request, id *auth.Identity)
 		Role:        id.User.Role,
 		Libraries:   libs,
 		AuthMethod:  id.Method,
+		CanUpload:   id.User.MayUpload(),
 	})
 }
 

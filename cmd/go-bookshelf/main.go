@@ -19,10 +19,13 @@ import (
 	"github.com/rake-pro/go-bookshelf/internal/auth"
 	"github.com/rake-pro/go-bookshelf/internal/config"
 	"github.com/rake-pro/go-bookshelf/internal/images"
+	"github.com/rake-pro/go-bookshelf/internal/importer"
 	"github.com/rake-pro/go-bookshelf/internal/library"
+	"github.com/rake-pro/go-bookshelf/internal/remote"
 	"github.com/rake-pro/go-bookshelf/internal/server"
 	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
+	"github.com/rake-pro/go-bookshelf/internal/upload"
 	"github.com/rake-pro/go-bookshelf/web"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -128,17 +131,30 @@ func run(cfg config.Config) error {
 	scanner := library.NewScanner(cat, covers)
 	janitor := library.NewJanitor(cat, covers)
 
+	// Adding books: uploads are filed by the upload service, and URL imports
+	// are queued and run one at a time by the worker below. The importer's
+	// HTTP client is built per job from the live settings, so changing whether
+	// private addresses are reachable does not need a restart.
+	uploads := upload.New(cat, scanner)
+	jobs := importer.NewJobs(db)
+	importWorker := importer.NewWorker(jobs, cat, uploads, func() *remote.Fetcher {
+		return remote.New(true, set.Get().Metadata.AllowPrivate)
+	})
+
 	dist, err := fs.Sub(web.Dist, "dist")
 	if err != nil {
 		return err
 	}
-	handler := server.New(api.New(cfg, set, db, cat, authMgr, scanner, covers, version), authMgr, set, dist)
+	handler := server.New(
+		api.New(cfg, set, db, cat, authMgr, scanner, covers, version, uploads, jobs, importWorker),
+		authMgr, set, dist)
 
 	watcher := library.NewWatcher(cat, scanner, library.DefaultDebounce)
 	if err := watcher.Start(ctx); err != nil {
 		log.Warn().Err(err).Msg("filesystem watching is unavailable; scans will run on the timer only")
 	}
 	go janitor.Start(ctx, 6*time.Hour)
+	go importWorker.Run(ctx)
 	go periodicScan(ctx, scanner, set)
 
 	srv := &http.Server{

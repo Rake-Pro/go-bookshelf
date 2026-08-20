@@ -6,27 +6,106 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-- Service worker: the cache version is now stamped with the build version at
-  serve time. 0.2.1 shipped frontend fixes that installed clients never
-  received because the worker's cache key had not changed.
+### Added
+- **Adding books from the browser.** An "Add books" button on the library and
+  admin pages opens a sheet with two ways in.
+  - **Upload.** `POST /api/v1/libraries/{id}/upload` takes a multipart body of
+    one or more files and an optional `subdir`. Everything is validated before
+    it goes anywhere near the library: a size cap (200 MiB per EPUB, 2 GiB per
+    audio file) applied while streaming, an extension allowlist that follows the
+    library's kind, a magic-byte check for each format, and finally a parse by
+    the same reader the scanner uses. Uploads are staged in a hidden directory
+    inside the library root - which the scanner skips - and renamed into place
+    only once they pass, so a rejected file leaves the library untouched. The
+    name on disk is derived from the book's own metadata
+    (`<Author> - <Title>.epub`, or a numbered directory for an audiobook), never
+    from the client's filename; several audio files whose album and author tags
+    agree become one book. Identical bytes already in the catalog answer 409
+    with the existing item.
+  - **Import from a URL.** `POST /api/v1/libraries/{id}/import` queues a job
+    (`GET /me/imports`, `GET|DELETE /imports/{id}`) that a worker runs one at a
+    time through the SSRF-guarded HTTP client. A URL that answers with a book
+    file goes straight into the upload validation path. A URL that answers with
+    a web page goes to a new web-story importer: metadata from `og:`/schema.org/
+    byline, the article body chosen by a readability-style scorer, sanitized to
+    an element and attribute allowlist with scripts, styles, forms, navigation,
+    footers and ad blocks removed, images re-fetched through the guard and
+    embedded, `rel="next"` and "next chapter" links followed on the same host at
+    one request a second, and the result built into an EPUB 3 - which is then
+    validated like any other upload. Per-site adapters can be added by
+    implementing `importer.Site` without touching the pipeline.
+  - **A new `can_upload` permission**, per account, with a toggle on the admin
+    users page. Administrators always have it, the `restricted` role never does,
+    and `GET /auth/me` answers `can_upload` with the role already folded in.
+    Migration `0004` adds the column (default 0, so an upgrade grants nobody
+    anything) and the `import_jobs` table.
+  - Uploads are rate limited per account and limited to one in flight per
+    account, so the 2 GiB cap cannot be multiplied by parallel requests.
+### Changed
+- **Reader layout.** The page now fills the viewport. The top bar and the footer
+  float over the text, hide themselves two seconds after the book opens and on
+  every page turn, and come back on a tap in the center of the page, on any key,
+  or as soon as focus enters them - they stay in the document, `inert` and
+  hidden, so keyboard and screen-reader users never lose them. The column
+  measure follows the reading size (~38em per column) instead of a fixed value,
+  a second column appears only on a landscape viewport at least 1100px wide, and
+  the side margins, page gap and running-head band scale with the margin
+  setting. A cover, title page or part divider is laid out as one centered page
+  rather than stranded in the left half of an empty spread.
+- **Reader themes.** Paper, Sepia, Gray, Night, high-contrast light and dark,
+  and Custom - each with its own link and selection colors. The theme is applied
+  to the reader's own chrome and sheets as well as to the page, so a dark page
+  no longer sits in a light frame, and `<meta name="theme-color">` follows it
+  while a book is open.
+- **Reader defaults** are now a reading size of 1.15 and a line height of 1.6
+  (`font_scale` also accepts 0.05 steps, was 0.1), with a book serif fallback
+  behind the publisher's own font.
+- **Reading settings** are grouped into Text, Theme and Layout with 44px
+  controls, theme swatches and a live preview, and open as a side panel from
+  900px wide so the page stays visible while it changes. Letter, word and
+  paragraph spacing moved into a "Fine tuning" section.
+- **Reader footer** shows how many pages are left in the chapter beside
+  "Page x of y", falling back to the chapter title when the renderer cannot
+  supply a count.
+- Swipe left or right on the page turns it, alongside the existing tap zones,
+  and the reader now respects the display cutout (safe-area) insets.
 
 ### Fixed
-- Reader: the book never rendered in a browser. Four causes, all client side:
-  the application CSP did not allow `blob:` frames, styles and fonts that the
-  renderer uses for chapter documents; the injected per-chapter CSP `<meta>`
-  tag was not self-closed, which made XHTML chapters unparseable; the book was
-  opened before the reader element was attached to the page, leaving the
-  renderer's iframe without a browsing context; and the mini-player set an
-  attribute in its constructor, which makes `document.createElement` throw.
-  Verified end to end in headless Chromium.
+- Reader: page turn announcements are throttled instead of narrating every
+  relocation, and the tap-zone overlay no longer swallows scrolling in the
+  scrolled reading mode.
+- Admin: the icon inside a text button no longer stretches to its container's
+  width, which had left the Scan button with an oversized glyph. A `.btn` inside
+  a link list keeps its own shape instead of being flattened into a list row.
+- Uploads: a rejected file's message no longer carries the `upload:` package
+  prefix into the browser.
+- URL imports of large files are no longer cut off after twenty seconds. The
+  buffered client's timeout covers reading the body, so a streamed download now
+  gets its own thirty-minute deadline on the context instead.
+
+## [0.2.2] - 2026-08-20
+
+### Fixed
+- Service worker: the cache version is stamped with the build version at serve
+  time, so installed clients actually receive a new frontend. 0.2.1's fixes had
+  shipped behind an unchanged cache key.
+
+## [0.2.1] - 2026-08-20
 
 ### Added
-- Libraries: `create_missing` on `POST /api/v1/setup/library` and
-  `POST /api/v1/libraries` creates the directory first (checkbox in the wizard
-  and the admin form), so an empty media share no longer blocks setup.
-- Settings: an OIDC issuer that points at this application's own base URL is
-  rejected with a clear message instead of a confusing discovery 404.
+- `create_missing` on `POST /api/v1/setup/library` and `POST /api/v1/libraries`
+  creates the directory first, so an empty media share no longer blocks setup.
+
+### Fixed
+- The reader now renders in a browser. Four client-side causes: the application
+  CSP blocked the `blob:` frames, styles and fonts the renderer needs; the
+  injected per-chapter CSP `<meta>` tag was not self-closed, making XHTML
+  chapters unparseable; the book was opened before the reader element was in
+  the document, leaving the renderer's iframe without a browsing context; and
+  the mini-player set an attribute in its constructor, which makes
+  `document.createElement` throw.
+- An OIDC issuer pointing at this application's own base URL is rejected with a
+  clear message instead of a confusing discovery 404.
 
 ## [0.2.0] - 2026-08-20
 
@@ -205,5 +284,8 @@ read-only.
   blocked by an injected `script-src 'none'` meta policy, stripped from the
   document on load, and forbidden by the response CSP.
 
-[Unreleased]: https://github.com/rake-pro/go-bookshelf/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rake-pro/go-bookshelf/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/rake-pro/go-bookshelf/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/rake-pro/go-bookshelf/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/rake-pro/go-bookshelf/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rake-pro/go-bookshelf/releases/tag/v0.1.0

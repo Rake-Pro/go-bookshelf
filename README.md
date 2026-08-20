@@ -29,6 +29,12 @@ is clean for a screen reader. See [Accessibility](#accessibility).
   reading positions are kept for another thirty in case the share comes back.
 - **Per-user state that follows you.** Progress, bookmarks, reader typography
   and player preferences are stored server-side per account.
+- **Add books from the browser.** Upload EPUBs and audio files, or paste a URL
+  and let the server fetch it - a book file, or a web story it reads, cleans up
+  and builds into an EPUB. Everything that arrives is validated by the same
+  parser the scanner uses before it is allowed anywhere near a library, and
+  filed under a name derived from its own metadata. See
+  [Adding books](#adding-books).
 - **Configured in the app, not the environment.** A setup wizard on first run
   and an admin settings page after it. Single sign-on, the base URL, sessions,
   cookies, scanning, proxy authentication and metrics access are all stored in
@@ -194,6 +200,83 @@ A `metadata.json` in the audiobook directory overrides the tags:
 }
 ```
 
+## Adding books
+
+Books normally arrive by being copied into a library directory, where the
+scanner finds them. The web app can also put them there for you, two ways.
+
+**Who may.** Adding books is a permission of its own, not a side effect of
+being able to read a library. Administrators always have it, accounts with the
+`restricted` role never do, and everybody in between is decided by a per-account
+switch on the admin page. It is off for every existing account after an upgrade,
+so nobody gains anything they did not have. The **Add books** button only
+appears for an account that may, and the library it writes into has to be one
+that account can already see.
+
+**Uploading.** Drag files onto the sheet, or pick them. The whole selection goes
+in one request, which matters for audiobooks: files whose album and author tags
+agree are grouped into one directory and become one book rather than several.
+
+What is accepted:
+
+| Library kind | Extensions | Size cap per file |
+|---|---|---|
+| Ebooks | `.epub` | 200 MiB |
+| Audiobooks | `.m4b`, `.m4a`, `.mp3` | 2 GiB |
+| Mixed | all four | as above |
+
+An extension is a claim, not evidence. Every file is checked against the format's
+magic bytes - a real zip with a `mimetype` entry declaring `application/epub+zip`
+for an EPUB, an `ftyp` box for MP4, an ID3 tag or a genuine MPEG frame header
+for MP3 - and then parsed by the same reader the scanner uses, with the same
+limits on archive entries and sizes. A file that fails any check is discarded
+and the library is exactly as it was: uploads are staged in a hidden directory
+inside the library root, which the scanner skips, and only renamed into place
+once they have passed.
+
+The name you upload under is never the name on disk. It is read for its
+extension and otherwise ignored, because a browser will happily send
+`../../etc/cron.d/x`. The name is derived from the book's own metadata:
+
+```
+A. Writer - The Long Afternoon.epub
+A. Writer - The Long Night/01 - Part One.mp3
+A. Writer - The Long Night/02 - Part Two.mp3
+```
+
+Names are folded to ASCII where a folding exists, stripped of everything a
+filesystem reserves, length-capped, and suffixed `(2)`, `(3)` if the name is
+taken. You can name one plain subfolder to file into; it is a name, not a path.
+Uploading a file the server already has, byte for byte, answers with a link to
+the copy you already have rather than a second copy.
+
+**Importing from a URL.** Paste a link and the server fetches it in the
+background; the sheet polls the job and you can cancel it. What the URL turns
+out to be is decided by the bytes, not by its extension or what the server
+claims it is:
+
+- **A book file** goes through exactly the same validation as an upload.
+- **A web page** goes to the story importer. It reads the title and author from
+  the page's own metadata (`og:title`, schema.org, a byline), picks out the
+  article body, strips scripts, styles, forms, navigation, footers, share bars,
+  comment threads and ad slots, keeps headings, paragraphs, lists and images,
+  re-fetches the images and embeds them, then follows "next chapter" links - on
+  the same site only, one request a second - and builds the lot into an EPUB.
+  The finished book is handed to the upload validation path like anything else,
+  because the server having built it is no reason to trust it.
+
+What the web importer does **not** do: it does not run JavaScript, so a page
+that renders its text client-side yields nothing; it does not sign in, so
+anything behind a login or a paywall is out of reach; it does not know any
+particular site's markup - the extractor is a general one and will sometimes
+take too much or too little; and it will not fetch a private, loopback or
+link-local address, so it cannot be used to make the server read its own
+network. Per-site adapters are the intended fix for the third of those and can
+be added without touching the pipeline.
+
+Imports are rate limited per account, run one at a time server-wide, and are
+capped at 2 GiB per download and 2,000 chapters per story.
+
 ## First run
 
 There are no default credentials. On a database with no accounts, the server
@@ -303,8 +386,10 @@ applied at the end. What that means in practice:
   paragraph spacing, margins, alignment, one or two columns, and paginated or
   scrolled flow. A dyslexia-friendly font stack is offered and falls back to the
   system sans when none of its faces are installed.
-- **Themes, including high contrast.** Light, dark, sepia, high-contrast light,
-  high-contrast dark, and a custom foreground/background pair. The app theme and
+- **Themes, including high contrast.** Paper, sepia, gray, night,
+  high-contrast light, high-contrast dark, and a custom foreground/background
+  pair. A reading theme colors the reader's own bars and sheets as well as the
+  page, so a dark page never sits in a light frame. The app theme and
   the reading theme are set separately. `prefers-color-scheme` is the default,
   and while the theme is left on automatic, `prefers-contrast: more` hardens the
   palette on its own.
@@ -353,6 +438,8 @@ A short tour of the shape:
 | `GET /items/{id}` | One item with its people, series, tags, files, chapters and your progress |
 | `GET /items/{id}/epub` | A reading manifest: spine, sizes, and where the resources live |
 | `GET /items/{id}/files/{file_id}/stream` | Audio, with range requests |
+| `POST /libraries/{id}/upload` | Add book files to a library (multipart) |
+| `POST /libraries/{id}/import` | Queue a URL import; `GET /me/imports` follows it |
 | `PUT /me/progress/{item_id}` | Where you got to, per device |
 | `GET|PUT /me/settings` | Reader, player and interface preferences |
 | `GET /system/status` | Admin: version, database size, item counts, last scans, whether SSO is on, when the settings last changed |

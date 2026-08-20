@@ -158,3 +158,91 @@ func checkScheme(u *url.URL) error {
 	}
 	return fmt.Errorf("%w: %q", ErrScheme, u.Scheme)
 }
+
+// MaxDownloadSize bounds a streamed download. It is far larger than
+// MaxResponseSize because this is the path a book arrives on, and an
+// audiobook legitimately runs to gigabytes; nothing is held in memory.
+const MaxDownloadSize = 2 << 30
+
+// MaxDownloadTime bounds a streamed download end to end. The buffered client's
+// 20-second Timeout cannot be used here: it covers reading the body as well as
+// getting the headers, so it would cut off any book that takes longer than that
+// to arrive - which, at the sizes this path exists for, is most of them.
+const MaxDownloadTime = 30 * time.Minute
+
+// Open performs a guarded GET and hands back the response body for streaming,
+// refusing to read more than max bytes from it.
+//
+// Every guard the buffered Get applies still applies here - the scheme check,
+// the literal-address check, the per-connection address check that runs after
+// DNS resolution, and the redirect check, which re-runs both for every hop -
+// because they all live below this call rather than in it. What changes is
+// only that the caller consumes the body instead of receiving it whole, and
+// that the deadline is the download's rather than a request's.
+func (f *Fetcher) Open(ctx context.Context, raw string, max int64) (io.ReadCloser, string, error) {
+	if err := f.CheckURL(raw); err != nil {
+		return nil, "", err
+	}
+	if max <= 0 || max > MaxDownloadSize {
+		max = MaxDownloadSize
+	}
+	// The deadline lives on the context, and so lasts until the body is closed
+	// rather than until Do returns. Everything below still applies: the same
+	// transport carries the dial-time address check, and the same redirect
+	// policy re-runs the scheme check per hop.
+	ctx, cancel := context.WithTimeout(ctx, MaxDownloadTime)
+	streaming := &http.Client{Transport: f.client.Transport, CheckRedirect: f.client.CheckRedirect}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+	if err != nil {
+		cancel()
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", "go-bookshelf")
+	resp, err := streaming.Do(req)
+	if err != nil {
+		cancel()
+		return nil, "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		cancel()
+		return nil, "", fmt.Errorf("remote: unexpected status %d", resp.StatusCode)
+	}
+	// A declared length over the cap is refused before a single byte of the
+	// body is read; a server that understates it is caught by the reader.
+	if resp.ContentLength > max {
+		resp.Body.Close()
+		cancel()
+		return nil, "", ErrTooLarge
+	}
+	return &cappedBody{body: resp.Body, left: max + 1, cancel: cancel}, resp.Header.Get("Content-Type"), nil
+}
+
+// cappedBody fails with ErrTooLarge instead of returning more than its limit.
+type cappedBody struct {
+	body   io.ReadCloser
+	left   int64
+	cancel context.CancelFunc
+}
+
+func (c *cappedBody) Read(p []byte) (int, error) {
+	if c.left <= 0 {
+		return 0, ErrTooLarge
+	}
+	if int64(len(p)) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.body.Read(p)
+	c.left -= int64(n)
+	if c.left <= 0 && err == nil {
+		return n, ErrTooLarge
+	}
+	return n, err
+}
+
+func (c *cappedBody) Close() error {
+	err := c.body.Close()
+	c.cancel()
+	return err
+}

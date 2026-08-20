@@ -17,11 +17,14 @@ import (
 	"github.com/rake-pro/go-bookshelf/internal/config"
 	"github.com/rake-pro/go-bookshelf/internal/fixtures"
 	"github.com/rake-pro/go-bookshelf/internal/images"
+	"github.com/rake-pro/go-bookshelf/internal/importer"
 	"github.com/rake-pro/go-bookshelf/internal/library"
+	"github.com/rake-pro/go-bookshelf/internal/remote"
 	"github.com/rake-pro/go-bookshelf/internal/server"
 	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
 	"github.com/rake-pro/go-bookshelf/internal/storetest"
+	"github.com/rake-pro/go-bookshelf/internal/upload"
 	"github.com/rs/zerolog"
 )
 
@@ -45,6 +48,10 @@ type harness struct {
 	handler  http.Handler
 	media    string
 	otherMe  string
+
+	uploads      *upload.Service
+	jobs         *importer.Jobs
+	importWorker *importer.Worker
 }
 
 type harnessOptions struct {
@@ -125,12 +132,22 @@ func newHarness(t *testing.T, opts ...harnessOptions) *harness {
 		t.Fatal(err)
 	}
 
-	a := api.New(cfg, set, db, cat, authMgr, scanner, covers, "test")
+	uploads := upload.New(cat, scanner)
+	jobs := importer.NewJobs(db)
+	// The same wiring as main: imports always fetch, and whether they may
+	// reach a private address comes from the stored settings. A test that
+	// points an import at an httptest server on the loopback address turns
+	// that switch on, exactly as an operator would.
+	importWorker := importer.NewWorker(jobs, cat, uploads, func() *remote.Fetcher {
+		return remote.New(true, set.Get().Metadata.AllowPrivate)
+	})
+	a := api.New(cfg, set, db, cat, authMgr, scanner, covers, "test", uploads, jobs, importWorker)
 	handler := server.New(a, authMgr, set, os.DirFS(mustFrontendStub(t, dir)))
 
 	return &harness{
 		t: t, ctx: ctx, cfg: cfg, settings: set, db: db, cat: cat, auth: authMgr,
 		scanner: scanner, handler: handler, media: media, otherMe: other,
+		uploads: uploads, jobs: jobs, importWorker: importWorker,
 	}
 }
 

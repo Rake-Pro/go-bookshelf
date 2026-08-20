@@ -4,9 +4,15 @@
  *
  * Every control writes through `store.update('reader', ...)`, which debounces a
  * single PUT /me/settings and mirrors to localStorage immediately.
+ *
+ * The controls carry their own <style> element rather than relying on app.css,
+ * because the reader opens them inside the sheet's shadow root where a document
+ * stylesheet does not reach. Every class is prefixed `rs-` so the same tag is
+ * harmless in the light DOM of the Settings page.
  */
 
 import { store, READER_DEFAULTS } from '../store.js';
+import { READER_PALETTES, readerPalette } from '../epub.js';
 import { icon } from './icons.js';
 import { announce } from '../live.js';
 
@@ -19,13 +25,20 @@ export const FONT_FAMILIES = [
 ];
 
 export const READER_THEMES = [
-  ['light', 'Light'],
-  ['dark', 'Dark'],
+  ['light', 'Paper'],
   ['sepia', 'Sepia'],
-  ['hc-light', 'High contrast light'],
-  ['hc-dark', 'High contrast dark'],
+  ['gray', 'Gray'],
+  ['dark', 'Night'],
+  ['hc-light', 'Contrast light'],
+  ['hc-dark', 'Contrast dark'],
   ['custom', 'Custom'],
 ];
+
+const SCALE_MIN = 0.7;
+const SCALE_MAX = 2.5;
+const SCALE_STEP = 0.05;
+/** A- / A+ move in bigger jumps than the slider's own step. */
+const SCALE_NUDGE = 0.1;
 
 /**
  * @param {() => void} onChange called after any setting changes
@@ -34,125 +47,174 @@ export const READER_THEMES = [
  */
 export function readerSettingsControls(onChange, opts = {}) {
   const frag = document.createDocumentFragment();
+  frag.append(controlsStyle());
+
+  const root = document.createElement('div');
+  root.className = 'rs';
+  frag.append(root);
+
   const r = () => store.reader;
   const set = (patch) => { store.update('reader', patch); onChange(); };
+  /** Re-read the store into every control; used after "reset". */
+  /** @type {(() => void)[]} */
+  const syncers = [];
 
-  /* --- font scale: A- / slider / A+ --- */
-  const scaleGroup = document.createElement('div');
-  scaleGroup.className = 'field';
+  /* ---------------- Text ---------------- */
+
+  const text = group('Text');
+
+  const sizeRow = document.createElement('div');
+  sizeRow.className = 'rs-row';
   const scaleLabel = document.createElement('span');
-  scaleLabel.className = 'label';
+  scaleLabel.className = 'rs-label';
   scaleLabel.id = 'lbl-font-scale';
-  scaleLabel.textContent = 'Text size';
+  scaleLabel.textContent = 'Size';
 
-  const scaleRow = document.createElement('div');
-  scaleRow.className = 'row';
-  scaleRow.style.flexWrap = 'nowrap';
-
-  const minus = bigButton('aMinus', 'Decrease text size', () => nudge(-0.1));
-  const plus = bigButton('aPlus', 'Increase text size', () => nudge(0.1));
+  const minus = stepButton('aMinus', 'Decrease text size', () => nudge(-SCALE_NUDGE));
+  const plus = stepButton('aPlus', 'Increase text size', () => nudge(SCALE_NUDGE));
 
   const scale = document.createElement('input');
   scale.type = 'range';
-  scale.min = '0.7';
-  scale.max = '2.5';
-  scale.step = '0.1';
+  scale.className = 'rs-range';
+  scale.min = String(SCALE_MIN);
+  scale.max = String(SCALE_MAX);
+  scale.step = String(SCALE_STEP);
   scale.value = String(r().font_scale);
   scale.setAttribute('aria-labelledby', 'lbl-font-scale');
-  scale.style.flex = '1';
 
   const scaleOut = document.createElement('output');
-  scaleOut.style.minWidth = '3.5rem';
-  scaleOut.style.textAlign = 'right';
-  scaleOut.style.fontVariantNumeric = 'tabular-nums';
+  scaleOut.className = 'rs-out';
 
   const syncScale = () => {
     scale.value = String(r().font_scale);
     scale.setAttribute('aria-valuetext', `${Math.round(r().font_scale * 100)} percent`);
     scaleOut.textContent = `${Math.round(r().font_scale * 100)}%`;
-    minus.disabled = r().font_scale <= 0.7;
-    plus.disabled = r().font_scale >= 2.5;
+    minus.disabled = r().font_scale <= SCALE_MIN;
+    plus.disabled = r().font_scale >= SCALE_MAX;
   };
 
   /** @param {number} delta */
   function nudge(delta) {
-    const v = clamp(round1(r().font_scale + delta), 0.7, 2.5);
+    const v = clamp(round2(r().font_scale + delta), SCALE_MIN, SCALE_MAX);
     set({ font_scale: v });
     syncScale();
     announce(`Text size ${Math.round(v * 100)} percent`);
   }
 
   scale.addEventListener('input', () => {
-    set({ font_scale: clamp(round1(Number(scale.value)), 0.7, 2.5) });
+    set({ font_scale: clamp(round2(Number(scale.value)), SCALE_MIN, SCALE_MAX) });
     syncScale();
   });
 
-  scaleRow.append(minus, scale, plus, scaleOut);
-  scaleGroup.append(scaleLabel, scaleRow);
+  sizeRow.append(scaleLabel, minus, scale, plus, scaleOut);
+  text.append(sizeRow);
   syncScale();
-  frag.append(scaleGroup);
 
-  if (opts.preview !== false) frag.append(preview());
+  text.append(segmented('Font', 'reader-font', FONT_FAMILIES, () => r().font_family,
+    (v) => set({ font_family: /** @type {any} */ (v) }), syncers, { wrap: true }));
 
-  /* --- theme --- */
-  frag.append(radioGroup('Reader theme', 'reader-theme', READER_THEMES, r().theme,
-    (v) => { set({ theme: /** @type {any} */ (v) }); syncCustom(); }));
+  root.append(text);
+
+  if (opts.preview !== false) root.append(preview());
+
+  /* ---------------- Theme ---------------- */
+
+  const theme = group('Theme');
+  const swatches = document.createElement('div');
+  swatches.className = 'rs-swatches';
+  swatches.setAttribute('role', 'radiogroup');
+  swatches.setAttribute('aria-label', 'Reader theme');
+  /** @type {HTMLLabelElement[]} */
+  const swatchEls = [];
+  for (const [value, label] of READER_THEMES) {
+    const el = swatch(value, label, () => {
+      set({ theme: /** @type {any} */ (value) });
+      syncTheme();
+      announce(`${label} theme`);
+    });
+    swatchEls.push(el);
+    swatches.append(el);
+  }
+  theme.append(swatches);
 
   const custom = document.createElement('div');
-  custom.className = 'row';
-  custom.style.marginBottom = 'var(--s4)';
+  custom.className = 'rs-row rs-custom';
   custom.append(
-    colorField('Text color', r().custom_fg, (v) => set({ custom_fg: v })),
-    colorField('Background', r().custom_bg, (v) => set({ custom_bg: v })),
+    colorField('Text', () => r().custom_fg, (v) => { set({ custom_fg: v }); syncTheme(); }),
+    colorField('Background', () => r().custom_bg, (v) => { set({ custom_bg: v }); syncTheme(); }),
   );
-  const syncCustom = () => { custom.hidden = r().theme !== 'custom'; };
-  syncCustom();
-  frag.append(custom);
+  theme.append(custom);
 
-  /* --- typography --- */
-  frag.append(selectField('Font', FONT_FAMILIES, r().font_family,
-    (v) => set({ font_family: /** @type {any} */ (v) })));
+  const syncTheme = () => {
+    for (const el of swatchEls) {
+      const on = el.dataset.value === r().theme;
+      el.classList.toggle('is-on', on);
+      /** @type {HTMLInputElement} */ (el.querySelector('input')).checked = on;
+      if (el.dataset.value === 'custom') {
+        const chip = /** @type {HTMLElement} */ (el.querySelector('.rs-chip'));
+        chip.style.background = r().custom_bg;
+        chip.style.color = r().custom_fg;
+      }
+    }
+    custom.hidden = r().theme !== 'custom';
+  };
+  syncTheme();
+  root.append(theme);
 
-  frag.append(rangeField('Line height', r().line_height, 1, 2.4, 0.05,
-    (v) => set({ line_height: v }), (v) => v.toFixed(2)));
+  /* ---------------- Layout ---------------- */
 
-  frag.append(rangeField('Letter spacing', r().letter_spacing, -0.05, 0.3, 0.01,
-    (v) => set({ letter_spacing: v }), (v) => `${v.toFixed(2)}em`));
+  const layout = group('Layout');
 
-  frag.append(rangeField('Word spacing', r().word_spacing, 0, 1, 0.05,
-    (v) => set({ word_spacing: v }), (v) => `${v.toFixed(2)}em`));
+  layout.append(segmented('Margins', 'reader-margin',
+    [['narrow', 'Narrow'], ['normal', 'Normal'], ['wide', 'Wide']],
+    () => r().margin, (v) => set({ margin: /** @type {any} */ (v) }), syncers));
 
-  frag.append(rangeField('Paragraph spacing', r().paragraph_spacing, 0, 3, 0.25,
-    (v) => set({ paragraph_spacing: v }), (v) => `${v.toFixed(2)}em`));
+  layout.append(rangeRow('Line spacing', () => r().line_height, 1.2, 2.4, 0.05,
+    (v) => set({ line_height: v }), (v) => v.toFixed(2), syncers));
 
-  /* --- layout --- */
-  frag.append(radioGroup('Margins', 'reader-margin',
-    [['narrow', 'Narrow'], ['normal', 'Normal'], ['wide', 'Wide']], r().margin,
-    (v) => set({ margin: /** @type {any} */ (v) })));
+  layout.append(segmented('Alignment', 'reader-align',
+    [['publisher', 'As published'], ['left', 'Left'], ['justify', 'Justified']],
+    () => r().align, (v) => set({ align: /** @type {any} */ (v) }), syncers, { wrap: true }));
 
-  frag.append(radioGroup('Text alignment', 'reader-align',
-    [['publisher', 'As published'], ['left', 'Left'], ['justify', 'Justified']], r().align,
-    (v) => set({ align: /** @type {any} */ (v) })));
+  layout.append(segmented('Reading mode', 'reader-layout',
+    [['paginated', 'Pages'], ['scrolled', 'Scrolling']],
+    () => r().layout, (v) => set({ layout: /** @type {any} */ (v) }), syncers));
 
-  frag.append(radioGroup('Layout', 'reader-layout',
-    [['paginated', 'Pages'], ['scrolled', 'Scrolling']], r().layout,
-    (v) => set({ layout: /** @type {any} */ (v) })));
+  layout.append(segmented('Columns', 'reader-columns',
+    [['auto', 'Automatic'], ['1', 'One'], ['2', 'Two']],
+    () => r().columns, (v) => set({ columns: /** @type {any} */ (v) }), syncers));
 
-  frag.append(radioGroup('Columns', 'reader-columns',
-    [['auto', 'Automatic'], ['1', 'One'], ['2', 'Two']], r().columns,
-    (v) => set({ columns: /** @type {any} */ (v) })));
+  root.append(layout);
 
-  /* --- reset --- */
+  /* ---------------- Fine tuning ---------------- */
+
+  const more = document.createElement('details');
+  more.className = 'rs-more';
+  const summary = document.createElement('summary');
+  summary.textContent = 'Fine tuning';
+  more.append(summary);
+
+  more.append(rangeRow('Letter spacing', () => r().letter_spacing, -0.05, 0.3, 0.01,
+    (v) => set({ letter_spacing: v }), (v) => `${v.toFixed(2)}em`, syncers));
+  more.append(rangeRow('Word spacing', () => r().word_spacing, 0, 1, 0.05,
+    (v) => set({ word_spacing: v }), (v) => `${v.toFixed(2)}em`, syncers));
+  more.append(rangeRow('Paragraph spacing', () => r().paragraph_spacing, 0, 3, 0.25,
+    (v) => set({ paragraph_spacing: v }), (v) => `${v.toFixed(2)}em`, syncers));
+
   const reset = document.createElement('button');
   reset.type = 'button';
-  reset.className = 'btn';
+  reset.className = 'rs-btn';
   reset.textContent = 'Reset reading settings';
   reset.addEventListener('click', () => {
     store.update('reader', { ...READER_DEFAULTS });
     announce('Reading settings reset');
+    syncScale();
+    syncTheme();
+    for (const sync of syncers) sync();
     onChange();
   });
-  frag.append(reset);
+  more.append(reset);
+  root.append(more);
 
   return frag;
 }
@@ -160,11 +222,9 @@ export function readerSettingsControls(onChange, opts = {}) {
 /** Live sample paragraph that reflects the current settings. */
 function preview() {
   const box = document.createElement('div');
-  box.className = 'card';
-  box.style.marginBottom = 'var(--s4)';
+  box.className = 'rs-preview';
   box.setAttribute('aria-label', 'Text preview');
   const p = document.createElement('p');
-  p.style.margin = '0';
   p.textContent =
     'The quick brown fox jumps over the lazy dog. Sample text shows how a page '
     + 'will look with the current size, spacing and theme.';
@@ -177,14 +237,17 @@ function preview() {
     }
     if (box.isConnected) box.dataset.wasConnected = '1';
     const s = store.reader;
-    box.style.background = 'var(--reader-bg)';
-    box.style.color = 'var(--reader-fg)';
+    // Painted from the palette rather than the reader tokens: on the Settings
+    // page no reading theme is applied to <html>, so the sample must carry it.
+    const pal = readerPalette(s);
+    box.style.background = pal.bg;
+    box.style.color = pal.fg;
     p.style.fontSize = `${s.font_scale}em`;
     p.style.lineHeight = String(s.line_height);
     p.style.letterSpacing = `${s.letter_spacing}em`;
     p.style.wordSpacing = `${s.word_spacing}em`;
     p.style.textAlign = s.align === 'publisher' ? 'start' : s.align;
-    p.style.fontFamily = fontStack(s.font_family) || 'inherit';
+    p.style.fontFamily = fontStack(s.font_family) || 'var(--font-serif)';
   };
   apply();
   store.addEventListener('settings', apply);
@@ -204,18 +267,174 @@ export function fontStack(family) {
 
 /* ---------------- small form helpers ---------------- */
 
-function bigButton(iconName, label, onClick) {
+/** @param {string} title */
+function group(title) {
+  const section = document.createElement('section');
+  section.className = 'rs-group';
+  const h = document.createElement('h3');
+  h.className = 'rs-legend';
+  h.textContent = title;
+  section.append(h);
+  return section;
+}
+
+/** @param {string} iconName @param {string} label @param {() => void} onClick */
+function stepButton(iconName, label, onClick) {
   const b = document.createElement('button');
   b.type = 'button';
-  b.className = 'btn';
-  b.style.minWidth = '3.25rem';
-  b.style.minHeight = '3.25rem';
+  b.className = 'rs-step';
   b.setAttribute('aria-label', label);
   b.title = label;
   b.append(icon(iconName));
   b.addEventListener('click', onClick);
   return b;
 }
+
+/**
+ * Segmented control: one radio per option, styled as a single strip. The
+ * radios stay real inputs (arrow-key navigation, screen reader semantics);
+ * only their default rendering is hidden.
+ *
+ * @param {string} legend
+ * @param {string} name
+ * @param {[string,string][]} options
+ * @param {() => string} value
+ * @param {(v:string) => void} onChange
+ * @param {(() => void)[]} syncers
+ * @param {{wrap?:boolean}} [opts]
+ */
+function segmented(legend, name, options, value, onChange, syncers, opts = {}) {
+  const fs = document.createElement('fieldset');
+  fs.className = 'rs-field';
+  const lg = document.createElement('legend');
+  lg.className = 'rs-label';
+  lg.textContent = legend;
+  fs.append(lg);
+
+  const strip = document.createElement('div');
+  strip.className = opts.wrap ? 'rs-seg rs-seg--wrap' : 'rs-seg';
+  /** @type {HTMLLabelElement[]} */
+  const labels = [];
+  const sync = () => {
+    for (const l of labels) {
+      const on = l.dataset.value === value();
+      l.classList.toggle('is-on', on);
+      /** @type {HTMLInputElement} */ (l.querySelector('input')).checked = on;
+    }
+  };
+  syncers.push(() => sync());
+  for (const [v, label] of options) {
+    const l = document.createElement('label');
+    l.dataset.value = v;
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = name;
+    input.value = v;
+    input.checked = v === value();
+    input.addEventListener('change', () => {
+      if (!input.checked) return;
+      onChange(v);
+      sync();
+    });
+    const span = document.createElement('span');
+    span.textContent = label;
+    l.append(input, span);
+    labels.push(l);
+    strip.append(l);
+  }
+  sync();
+  fs.append(strip);
+  return fs;
+}
+
+/**
+ * @param {string} value @param {string} label @param {() => void} onChange
+ * @returns {HTMLLabelElement}
+ */
+function swatch(value, label, onChange) {
+  const l = document.createElement('label');
+  l.className = 'rs-swatch';
+  l.dataset.value = value;
+  const input = document.createElement('input');
+  input.type = 'radio';
+  input.name = 'reader-theme';
+  input.value = value;
+  input.addEventListener('change', () => { if (input.checked) onChange(); });
+  const chip = document.createElement('span');
+  chip.className = 'rs-chip';
+  chip.setAttribute('aria-hidden', 'true');
+  chip.textContent = 'Aa';
+  const p = READER_PALETTES[value];
+  if (p) {
+    chip.style.background = p.bg;
+    chip.style.color = p.fg;
+  }
+  const name = document.createElement('span');
+  name.className = 'rs-swatch-name';
+  name.textContent = label;
+  l.append(input, chip, name);
+  return l;
+}
+
+/**
+ * @param {string} label
+ * @param {() => number} value
+ * @param {number} min @param {number} max @param {number} step
+ * @param {(v:number) => void} onChange
+ * @param {(v:number) => string} fmt
+ * @param {(() => void)[]} syncers
+ */
+function rangeRow(label, value, min, max, step, onChange, fmt, syncers) {
+  const wrap = document.createElement('div');
+  wrap.className = 'rs-field';
+  const l = document.createElement('label');
+  l.className = 'rs-label';
+  const id = 'rs-' + label.toLowerCase().replace(/\W+/g, '-');
+  l.setAttribute('for', id);
+  l.textContent = label;
+  const row = document.createElement('div');
+  row.className = 'rs-row';
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.className = 'rs-range';
+  input.id = id;
+  input.min = String(min);
+  input.max = String(max);
+  input.step = String(step);
+  input.value = String(value());
+  const out = document.createElement('output');
+  out.className = 'rs-out';
+  const sync = () => {
+    out.textContent = fmt(Number(input.value));
+    input.setAttribute('aria-valuetext', out.textContent);
+  };
+  sync();
+  syncers.push(() => { input.value = String(value()); sync(); });
+  input.addEventListener('input', () => { onChange(Number(input.value)); sync(); });
+  row.append(input, out);
+  wrap.append(l, row);
+  return wrap;
+}
+
+/**
+ * @param {string} label @param {() => string} value @param {(v:string) => void} onChange
+ */
+function colorField(label, value, onChange) {
+  const wrap = document.createElement('label');
+  wrap.className = 'rs-color';
+  const l = document.createElement('span');
+  l.className = 'rs-label';
+  l.textContent = label;
+  const input = document.createElement('input');
+  input.type = 'color';
+  input.value = value();
+  input.setAttribute('aria-label', `${label} color`);
+  input.addEventListener('input', () => onChange(input.value));
+  wrap.append(l, input);
+  return wrap;
+}
+
+/* ---------------- radio / select / range for the Settings page ---------------- */
 
 /**
  * @param {string} legend
@@ -322,24 +541,171 @@ export function rangeField(label, value, min, max, step, onChange, fmt) {
 }
 
 /**
- * @param {string} label @param {string} value @param {(v:string) => void} onChange
+ * Styles for the controls above. Travels with the fragment so it works both in
+ * the light DOM (Settings page) and inside the sheet's shadow root (reader).
  */
-function colorField(label, value, onChange) {
-  const wrap = document.createElement('label');
-  wrap.className = 'field';
-  wrap.style.margin = '0';
-  const l = document.createElement('span');
-  l.className = 'label';
-  l.textContent = label;
-  const input = document.createElement('input');
-  input.type = 'color';
-  input.value = value;
-  input.style.minHeight = 'var(--tap)';
-  input.style.minWidth = '4rem';
-  input.addEventListener('input', () => onChange(input.value));
-  wrap.append(l, input);
-  return wrap;
+function controlsStyle() {
+  const style = document.createElement('style');
+  style.textContent = `
+.rs { display: grid; gap: var(--s6); font-family: var(--font); }
+.rs, .rs * { box-sizing: border-box; }
+/* A class that sets display would otherwise beat the UA rule for [hidden]. */
+.rs [hidden] { display: none !important; }
+.rs-group { display: grid; gap: var(--s3); }
+.rs-legend {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.rs-field { display: grid; gap: var(--s2); margin: 0; padding: 0; border: 0; min-width: 0; }
+.rs-label { display: block; padding: 0; font-size: 0.95rem; font-weight: 600; }
+.rs-row { display: flex; align-items: center; gap: var(--s2); }
+.rs-out {
+  min-width: 3.5rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
 }
 
-const round1 = (n) => Math.round(n * 10) / 10;
+.rs-range {
+  flex: 1;
+  width: 100%;
+  height: var(--tap);
+  margin: 0;
+  accent-color: var(--accent);
+  background: transparent;
+}
+.rs-range:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+.rs-step, .rs-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: var(--s2) var(--s4);
+  font: inherit;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.rs-step { padding: 0; }
+.rs-step svg { width: 1.5rem; height: 1.5rem; }
+.rs-step:disabled { opacity: 0.45; cursor: not-allowed; }
+.rs-step:hover:not(:disabled), .rs-btn:hover { background: var(--surface-2); }
+.rs-step:focus-visible, .rs-btn:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.rs-btn { width: 100%; margin-top: var(--s3); }
+
+.rs-seg {
+  display: flex;
+  gap: var(--s1);
+  padding: var(--s1);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.rs-seg--wrap {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+}
+.rs-seg label {
+  position: relative;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--tap);
+  padding: 0 var(--s3);
+  border-radius: var(--radius-sm);
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-align: center;
+  cursor: pointer;
+}
+.rs-seg input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.rs-seg label.is-on {
+  color: var(--accent-text);
+  background: var(--accent);
+}
+.rs-seg label:hover:not(.is-on) { background: var(--surface); }
+.rs-seg label:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+.rs-swatches {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  gap: var(--s2);
+}
+.rs-swatch {
+  position: relative;
+  display: grid;
+  gap: var(--s1);
+  justify-items: center;
+  padding: var(--s2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.rs-swatch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.rs-chip {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 2.5rem;
+  border: 1px solid rgb(128 128 128 / 35%);
+  border-radius: var(--radius-sm);
+  font-size: 1rem;
+  font-weight: 700;
+  font-family: var(--font-serif);
+}
+.rs-swatch-name { font-size: 0.85rem; font-weight: 600; text-align: center; }
+.rs-swatch.is-on { border-color: var(--accent); box-shadow: inset 0 0 0 2px var(--accent); }
+.rs-swatch:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+.rs-custom { gap: var(--s4); }
+.rs-color { display: grid; gap: var(--s1); }
+.rs-color input {
+  width: 4.5rem;
+  height: var(--tap);
+  padding: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.rs-preview {
+  padding: var(--s4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--font-serif);
+}
+.rs-preview p { margin: 0; }
+
+.rs-more > summary {
+  min-height: var(--tap);
+  display: flex;
+  align-items: center;
+  font-weight: 600;
+  cursor: pointer;
+}
+.rs-more > summary:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.rs-more[open] { display: grid; gap: var(--s3); }
+`;
+  return style;
+}
+
+const round2 = (n) => Math.round(n * 100) / 100;
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));

@@ -13,7 +13,7 @@ const LS_KEY = 'bookshelf.settings.v1';
 
 /**
  * @typedef {Object} ReaderSettings
- * @property {number} font_scale        0.7 - 2.5, step 0.1
+ * @property {number} font_scale        0.7 - 2.5, step 0.05
  * @property {'publisher'|'system'|'serif'|'sans'|'dyslexic'} font_family
  * @property {number} line_height       1.0 - 2.4
  * @property {number} letter_spacing    em
@@ -21,7 +21,7 @@ const LS_KEY = 'bookshelf.settings.v1';
  * @property {number} paragraph_spacing em
  * @property {'narrow'|'normal'|'wide'} margin
  * @property {'publisher'|'left'|'justify'} align
- * @property {'light'|'dark'|'sepia'|'hc-dark'|'hc-light'|'custom'} theme
+ * @property {'light'|'dark'|'sepia'|'gray'|'hc-dark'|'hc-light'|'custom'} theme
  * @property {string} custom_fg
  * @property {string} custom_bg
  * @property {'paginated'|'scrolled'} layout
@@ -46,9 +46,9 @@ const LS_KEY = 'bookshelf.settings.v1';
 
 /** @type {ReaderSettings} */
 export const READER_DEFAULTS = {
-  font_scale: 1.0,
+  font_scale: 1.15,
   font_family: 'publisher',
-  line_height: 1.5,
+  line_height: 1.6,
   letter_spacing: 0,
   word_spacing: 0,
   paragraph_spacing: 0,
@@ -175,6 +175,12 @@ class Store extends EventTarget {
   }
 
   get isAdmin() { return this.user?.role === 'admin'; }
+
+  /**
+   * Whether this account may add books. The server folds the role into the
+   * flag before answering `/auth/me`, so there is one rule and it lives there.
+   */
+  get canUpload() { return this.user?.can_upload === true; }
 
   /**
    * Resolve and apply the app theme to <html>.

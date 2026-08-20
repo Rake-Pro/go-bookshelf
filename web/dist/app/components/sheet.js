@@ -1,6 +1,8 @@
 /**
  * Modal bottom sheet built on <dialog>, which gives focus trapping, Escape and
- * inert background for free. On wide screens it centers as a panel instead.
+ * inert background for free. On wide screens it centers as a panel instead, or
+ * docks to the side when the caller asks for it (`openSheet(..., {dock:'side'})`)
+ * so the page behind stays readable while its settings change.
  */
 
 import { iconButton } from './icons.js';
@@ -24,6 +26,21 @@ dialog {
 dialog::backdrop { background: var(--scrim); }
 @media (min-width: 48rem) {
   dialog { margin: auto; border-radius: var(--radius); }
+}
+/* Side dock: a panel against the inline end, full height, so the reader page
+   behind it stays visible and every change previews on the real text. */
+@media (min-width: 56.25rem) {
+  dialog.dock-side {
+    width: min(26rem, 40vw);
+    max-width: none;
+    height: 100dvh;
+    max-height: none;
+    margin: 0 0 0 auto;
+    border-radius: var(--radius) 0 0 var(--radius);
+    border-right: 0;
+  }
+  dialog.dock-side .body { max-height: calc(100dvh - 3.5rem); }
+  dialog.dock-side::backdrop { background: transparent; }
 }
 header {
   display: flex;
@@ -96,6 +113,11 @@ export class Sheet extends HTMLElement {
 
   get body() { return this.#body; }
 
+  /** @param {string} name */
+  dock(name) {
+    this.#dialog.classList.toggle('dock-side', name === 'side');
+  }
+
   open() {
     if (!this.#dialog.open) this.#dialog.showModal();
   }
@@ -114,12 +136,14 @@ customElements.define('bs-sheet', Sheet);
  * @param {Element} host
  * @param {string} heading
  * @param {Node|Node[]} content
+ * @param {{dock?:'bottom'|'side'}} [opts]
  * @returns {Sheet}
  */
-export function openSheet(host, heading, content) {
+export function openSheet(host, heading, content, opts = {}) {
   const s = /** @type {Sheet} */ (document.createElement('bs-sheet'));
   s.heading = heading;
   host.append(s);
+  s.dock(opts.dock || 'bottom');
   s.setContent(...(Array.isArray(content) ? content : [content]));
   s.addEventListener('sheet-close', () => s.remove());
   s.open();
