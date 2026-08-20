@@ -8,6 +8,7 @@ import (
 
 	"github.com/rake-pro/go-bookshelf/internal/auth"
 	"github.com/rake-pro/go-bookshelf/internal/library"
+	"github.com/rake-pro/go-bookshelf/internal/store"
 	"github.com/rs/zerolog/log"
 )
 
@@ -204,12 +205,20 @@ func (a *API) systemStatus(w http.ResponseWriter, r *http.Request) {
 			lastScans[l.ID] = &runs[0]
 		}
 	}
-	// Only a SQLite installation has a file to measure; a Postgres one reports
-	// zero rather than a number the admin page would have to caveat.
+	// SQLite: size of the database file. Postgres: pg_database_size of the
+	// connected database (includes indexes and cover bytes).
 	var dbSize int64
-	if a.cfg.DBPath != "" {
-		if info, err := os.Stat(a.cfg.DBPath); err == nil {
-			dbSize = info.Size()
+	switch a.db.Dialect().Name() {
+	case store.DriverPostgres:
+		if err := a.db.QueryRowContext(r.Context(),
+			`SELECT pg_database_size(current_database())`).Scan(&dbSize); err != nil {
+			dbSize = 0
+		}
+	default:
+		if a.cfg.DBPath != "" {
+			if info, err := os.Stat(a.cfg.DBPath); err == nil {
+				dbSize = info.Size()
+			}
 		}
 	}
 	users, err := a.auth.UserCount(r.Context())
