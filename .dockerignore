@@ -1,0 +1,16 @@
+.git
+.github
+.gitignore
+.smoketest
+.gotmp
+bin
+out
+docs
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+config.yaml
+CHANGELOG.md
+README.md
+LICENSE

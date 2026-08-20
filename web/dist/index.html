@@ -1,0 +1,36 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bookshelf</title>
+<meta name="description" content="Your ebook and audiobook library.">
+<meta name="theme-color" content="#faf8f4">
+<meta name="color-scheme" content="light dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Bookshelf">
+
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
+<link rel="stylesheet" href="/app/tokens.css">
+<link rel="stylesheet" href="/app/app.css">
+<link rel="modulepreload" href="/app/api.js">
+<link rel="modulepreload" href="/app/store.js">
+<link rel="modulepreload" href="/app/router.js">
+
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<div id="app">
+  <div class="state" role="status">
+    <div class="spinner"></div>
+    <p>Loading Bookshelf...</p>
+  </div>
+</div>
+
+<!-- Screen reader announcements: player state, page changes, saved settings. -->
+<div id="live-polite" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+<div id="live-assertive" class="visually-hidden" role="alert" aria-live="assertive" aria-atomic="true"></div>
+
+<noscript>
+  <p style="padding:1rem">Bookshelf needs JavaScript to read and play your library.</p>
+</noscript>
+
+<script type="module" src="/app/main.js"></script>

@@ -1,0 +1,150 @@
+/* Design tokens. Every color, radius and spacing value in the app comes from
+   here. Never set a px font-size on :root - OS text scaling must apply. */
+
+:root {
+  color-scheme: light dark;
+
+  /* Light palette (default) */
+  --bg: #faf8f4;
+  --surface: #ffffff;
+  --surface-2: #f1ede6;
+  --text: #1f1d1a;
+  --muted: #6b655d;
+  --accent: #c2561f;
+  --accent-text: #ffffff;
+  --border: #e3ddd3;
+  --focus: #1f6f78;
+
+  --danger: #a32d16;
+  --ok: #1f6f4a;
+  --shadow: 0 1px 2px rgb(31 29 26 / 8%), 0 8px 24px rgb(31 29 26 / 6%);
+  --scrim: rgb(31 29 26 / 45%);
+
+  /* Spacing scale */
+  --s1: 0.25rem;  /*  4 */
+  --s2: 0.5rem;   /*  8 */
+  --s3: 0.75rem;  /* 12 */
+  --s4: 1rem;     /* 16 */
+  --s6: 1.5rem;   /* 24 */
+  --s8: 2rem;     /* 32 */
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --tap: 2.75rem;            /* 44px minimum touch target */
+  --line: 1.5;
+
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --font-serif: Georgia, "Iowan Old Style", "Times New Roman", Times, serif;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  /* No font files are bundled. "dyslexic" maps to whatever the OS provides. */
+  --font-dyslexic: "OpenDyslexic", "Lexie Readable", "Comic Sans MS",
+    "Comic Neue", Verdana, sans-serif;
+
+  --sidebar-w: 15rem;
+  --miniplayer-h: 4.5rem;
+  --tabbar-h: 3.75rem;
+  --appbar-h: 3.5rem;
+
+  --motion: 160ms;
+}
+
+/* Dark palette: applied when the OS asks for it and no explicit light override */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141210;
+    --surface: #1f1c19;
+    --surface-2: #2a2622;
+    --text: #ece7df;
+    --muted: #a39b90;
+    --accent: #e8834f;
+    --accent-text: #141210;
+    --border: #36302a;
+    --focus: #6fd3dd;
+    --danger: #ef7f65;
+    --ok: #5fc294;
+    --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px rgb(0 0 0 / 32%);
+    --scrim: rgb(0 0 0 / 60%);
+  }
+}
+
+/* Explicit user choice wins in both directions */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #141210;
+  --surface: #1f1c19;
+  --surface-2: #2a2622;
+  --text: #ece7df;
+  --muted: #a39b90;
+  --accent: #e8834f;
+  --accent-text: #141210;
+  --border: #36302a;
+  --focus: #6fd3dd;
+  --danger: #ef7f65;
+  --ok: #5fc294;
+  --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px rgb(0 0 0 / 32%);
+  --scrim: rgb(0 0 0 / 60%);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="hc-light"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #ffffff;
+  --text: #000000;
+  --muted: #1a1a1a;
+  --accent: #8c2f00;
+  --accent-text: #ffffff;
+  --border: #000000;
+  --focus: #0043a8;
+  --danger: #8c0000;
+  --ok: #005c33;
+  --shadow: none;
+  --scrim: rgb(0 0 0 / 70%);
+}
+
+:root[data-theme="hc-dark"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --surface: #000000;
+  --surface-2: #000000;
+  --text: #ffffff;
+  --muted: #e6e6e6;
+  --accent: #ffd400;
+  --accent-text: #000000;
+  --border: #ffffff;
+  --focus: #ffd400;
+  --danger: #ff8f7a;
+  --ok: #6bf0ae;
+  --shadow: none;
+  --scrim: rgb(0 0 0 / 80%);
+}
+
+/* prefers-contrast forces a high-contrast theme unless the user picked one.
+   data-theme-source="auto" is set by the app when the theme is not explicit. */
+@media (prefers-contrast: more) {
+  :root[data-theme-source="auto"] {
+    --surface-2: var(--surface);
+    --muted: var(--text);
+    --border: var(--text);
+    --shadow: none;
+  }
+}
+
+/* Reader surface tokens. The reader sets data-reader-theme on <html>; these
+   feed both the reader chrome and the stylesheet injected into the book. */
+:root {
+  --reader-bg: var(--bg);
+  --reader-fg: var(--text);
+  --reader-link: var(--accent);
+}
+:root[data-reader-theme="light"]   { --reader-bg: #faf8f4; --reader-fg: #1f1d1a; --reader-link: #c2561f; }
+:root[data-reader-theme="dark"]    { --reader-bg: #141210; --reader-fg: #ece7df; --reader-link: #e8834f; }
+:root[data-reader-theme="sepia"]   { --reader-bg: #f4ecd8; --reader-fg: #5b4636; --reader-link: #8c4a1f; }
+:root[data-reader-theme="hc-light"]{ --reader-bg: #ffffff; --reader-fg: #000000; --reader-link: #0043a8; }
+:root[data-reader-theme="hc-dark"] { --reader-bg: #000000; --reader-fg: #ffffff; --reader-link: #ffd400; }
+:root[data-reader-theme="custom"]  { --reader-bg: var(--custom-bg, #faf8f4); --reader-fg: var(--custom-fg, #1f1d1a); --reader-link: var(--accent); }

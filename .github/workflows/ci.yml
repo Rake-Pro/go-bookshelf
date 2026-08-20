@@ -1,0 +1,64 @@
+name: CI
+
+# No paths filters: the "build" check is required on prod promotion PRs, so it
+# must exist on every main SHA - a filtered-out push would block promotion.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build, vet, and the full test suite.
+  test-sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$unformatted" ]; then echo "gofmt needed on:"; echo "$unformatted"; exit 1; fi
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: frontend static check
+        run: go run ./scripts/checkweb
+      - name: test
+        run: go test ./... -count=1
+      - name: smoke
+        run: ./scripts/smoke.sh
+
+  build:
+    needs: [test-sqlite]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Validation only: the image is built but never pushed. Runs on every push
+      # to main so the check lands on the SHA the main -> prod PR points at.
+      - name: Build (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

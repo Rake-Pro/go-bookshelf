@@ -1,0 +1,237 @@
+-- Initial schema. Timestamps are RFC3339 UTC strings; ids are rowid aliases.
+
+CREATE TABLE libraries (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('ebook', 'audiobook', 'mixed')),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE library_paths (
+    library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,
+    PRIMARY KEY (library_id, path)
+);
+
+CREATE TABLE items (
+    id          INTEGER PRIMARY KEY,
+    library_id  INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL CHECK (kind IN ('ebook', 'audiobook')),
+    title       TEXT NOT NULL,
+    sort_title  TEXT NOT NULL DEFAULT '',
+    subtitle    TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    language    TEXT NOT NULL DEFAULT '',
+    published   TEXT NOT NULL DEFAULT '',
+    isbn        TEXT NOT NULL DEFAULT '',
+    asin        TEXT NOT NULL DEFAULT '',
+    publisher   TEXT NOT NULL DEFAULT '',
+    cover_path  TEXT NOT NULL DEFAULT '',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    size_bytes  INTEGER NOT NULL DEFAULT 0,
+    source_key  TEXT NOT NULL,
+    added_at    TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    missing_at  TEXT
+);
+
+-- source_key is the on-disk anchor an item was ingested from (the .epub file,
+-- or the audiobook directory). It is what a rescan matches on.
+CREATE UNIQUE INDEX items_source_key ON items (library_id, source_key);
+CREATE INDEX items_library ON items (library_id, kind);
+CREATE INDEX items_sort_title ON items (sort_title);
+CREATE INDEX items_added ON items (added_at);
+CREATE INDEX items_missing ON items (missing_at);
+
+CREATE TABLE files (
+    id          INTEGER PRIMARY KEY,
+    item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    path        TEXT NOT NULL UNIQUE,
+    size        INTEGER NOT NULL DEFAULT 0,
+    mtime       TEXT NOT NULL DEFAULT '',
+    sha1        TEXT NOT NULL DEFAULT '',
+    format      TEXT NOT NULL DEFAULT '',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    seq         INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX files_item ON files (item_id, seq);
+
+CREATE TABLE chapters (
+    file_id  INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    seq      INTEGER NOT NULL,
+    title    TEXT NOT NULL DEFAULT '',
+    start_ms INTEGER NOT NULL DEFAULT 0,
+    end_ms   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (file_id, seq)
+);
+
+CREATE TABLE people (
+    id        INTEGER PRIMARY KEY,
+    name      TEXT NOT NULL UNIQUE,
+    sort_name TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE item_people (
+    item_id   INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    role      TEXT NOT NULL CHECK (role IN ('author', 'narrator', 'translator')),
+    seq       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (item_id, person_id, role)
+);
+
+CREATE INDEX item_people_person ON item_people (person_id, role);
+
+CREATE TABLE series (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE item_series (
+    item_id   INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+    sequence  REAL,
+    PRIMARY KEY (item_id, series_id)
+);
+
+CREATE INDEX item_series_series ON item_series (series_id, sequence);
+
+CREATE TABLE tags (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE item_tags (
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    tag_id  INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (item_id, tag_id)
+);
+
+CREATE TABLE collections (
+    id      INTEGER PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    name    TEXT NOT NULL
+);
+
+CREATE TABLE collection_items (
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    item_id       INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (collection_id, item_id)
+);
+
+CREATE TABLE users (
+    id            INTEGER PRIMARY KEY,
+    username      TEXT NOT NULL UNIQUE,
+    display_name  TEXT NOT NULL DEFAULT '',
+    password_hash TEXT,
+    oidc_subject  TEXT,
+    role          TEXT NOT NULL CHECK (role IN ('admin', 'user', 'restricted')),
+    created_at    TEXT NOT NULL,
+    disabled_at   TEXT
+);
+
+CREATE UNIQUE INDEX users_oidc_subject ON users (oidc_subject) WHERE oidc_subject IS NOT NULL;
+
+CREATE TABLE user_library_access (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, library_id)
+);
+
+CREATE TABLE user_settings (
+    user_id     INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    reader_json TEXT NOT NULL DEFAULT '{}',
+    player_json TEXT NOT NULL DEFAULT '{}',
+    ui_json     TEXT NOT NULL DEFAULT '{}',
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE progress (
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    locator     TEXT NOT NULL DEFAULT '',
+    position_ms INTEGER NOT NULL DEFAULT 0,
+    percent     REAL NOT NULL DEFAULT 0,
+    finished_at TEXT,
+    device      TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (user_id, item_id)
+);
+
+CREATE INDEX progress_updated ON progress (user_id, updated_at);
+
+CREATE TABLE bookmarks (
+    id          INTEGER PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    locator     TEXT NOT NULL DEFAULT '',
+    position_ms INTEGER NOT NULL DEFAULT 0,
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX bookmarks_user_item ON bookmarks (user_id, item_id);
+
+CREATE TABLE sessions (
+    id         TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    user_agent TEXT NOT NULL DEFAULT '',
+    ip         TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX sessions_user ON sessions (user_id);
+
+CREATE TABLE api_tokens (
+    id           INTEGER PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name         TEXT NOT NULL DEFAULT '',
+    token_hash   TEXT NOT NULL UNIQUE,
+    scopes       TEXT NOT NULL DEFAULT 'read',
+    created_at   TEXT NOT NULL,
+    last_used_at TEXT
+);
+
+CREATE INDEX api_tokens_user ON api_tokens (user_id);
+
+CREATE TABLE scan_runs (
+    id          INTEGER PRIMARY KEY,
+    library_id  INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    added       INTEGER NOT NULL DEFAULT 0,
+    updated     INTEGER NOT NULL DEFAULT 0,
+    removed     INTEGER NOT NULL DEFAULT 0,
+    errors      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX scan_runs_library ON scan_runs (library_id, started_at);
+
+-- Single-row table holding the one-time first-run setup token hash. The token
+-- itself is printed to the log once at startup and never stored in clear.
+CREATE TABLE setup_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    token_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    used_at    TEXT
+);
+
+-- When the janitor hard-deletes an item whose files vanished, the users'
+-- reading positions are parked here for a grace period, keyed by the on-disk
+-- source so a library that comes back online restores them.
+CREATE TABLE progress_archive (
+    user_id     INTEGER NOT NULL,
+    library_id  INTEGER NOT NULL,
+    source_key  TEXT NOT NULL,
+    locator     TEXT NOT NULL DEFAULT '',
+    position_ms INTEGER NOT NULL DEFAULT 0,
+    percent     REAL NOT NULL DEFAULT 0,
+    finished_at TEXT,
+    device      TEXT NOT NULL DEFAULT '',
+    archived_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, library_id, source_key)
+);
+
+CREATE INDEX progress_archive_archived ON progress_archive (archived_at);

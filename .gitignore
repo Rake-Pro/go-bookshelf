@@ -1,0 +1,21 @@
+# Build output
+/bin/
+/out/
+/go-bookshelf
+
+# Local data / databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local config overrides
+config.yaml
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Local scratch dirs from manual smoke-testing
+/.smoketest/
+/.gotmp/

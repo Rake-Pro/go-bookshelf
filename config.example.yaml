@@ -1,0 +1,71 @@
+# go-bookshelf configuration.
+#
+# Every key below can also be set with a GOBOOKSHELF_* environment variable,
+# and the environment always wins over this file. Copy to config.yaml and pass
+# it with -config, or set GOBOOKSHELF_CONFIG to its path.
+#
+# Libraries (their names, kinds and paths) are NOT configured here: they are
+# created in the admin UI and stored in the database.
+
+# Address to bind. GOBOOKSHELF_LISTEN
+listen: ":8080"
+
+# SQLite database file. GOBOOKSHELF_DB_PATH
+db_path: "/data/go-bookshelf.db"
+
+# Writable directory for the cover cache. GOBOOKSHELF_DATA_DIR
+data_dir: "/data"
+
+# The URL users reach the server on. Used for the OIDC redirect, OPDS links,
+# and to decide whether session cookies are marked Secure.
+# GOBOOKSHELF_BASE_URL
+base_url: "http://localhost:8080"
+
+# trace | debug | info | warn | error. GOBOOKSHELF_LOG_LEVEL
+log_level: "info"
+
+# How often every library is rescanned in the background. The filesystem
+# watcher usually gets there first; this catches network shares that emit no
+# events. GOBOOKSHELF_SCAN_INTERVAL
+scan_interval: "6h"
+
+# How long a login session stays valid. GOBOOKSHELF_SESSION_TTL
+session_ttl: "720h"
+
+# Force the Secure flag on session cookies. Defaults to true when base_url is
+# https. GOBOOKSHELF_SECURE_COOKIES
+# secure_cookies: true
+
+# Optional login through an identity provider. All three of issuer, client_id
+# and client_secret must be set for OIDC to be offered at all. The redirect URI
+# to register with the provider is <base_url>/api/v1/auth/oidc/callback.
+oidc:
+  issuer: ""        # GOBOOKSHELF_OIDC_ISSUER
+  client_id: ""     # GOBOOKSHELF_OIDC_CLIENT_ID
+  client_secret: "" # GOBOOKSHELF_OIDC_CLIENT_SECRET
+  # Members of this group are granted the admin role on every login.
+  admin_group: ""   # GOBOOKSHELF_OIDC_ADMIN_GROUP
+  # Claim inspected for group membership.
+  groups_claim: "groups"
+  # Comma-separated scope list; the default is "openid,profile,email".
+  scopes: ""
+
+# Authentication delegated to a reverse proxy. The header is honored ONLY for
+# requests whose immediate peer address is inside trusted_proxies, so leaving
+# that list empty is refused at startup rather than silently trusting everyone.
+# proxy_auth_header: "Remote-User"   # GOBOOKSHELF_PROXY_AUTH_HEADER
+# trusted_proxies:                   # GOBOOKSHELF_TRUSTED_PROXIES
+#   - "10.0.0.0/8"
+#   - "192.168.0.0/16"
+
+# Who may read /metrics. Defaults to loopback plus the private ranges.
+# GOBOOKSHELF_METRICS_ALLOW
+# metrics_allow:
+#   - "127.0.0.0/8"
+#   - "10.0.0.0/8"
+
+# Online metadata lookup is off unless a provider is named here, and while it
+# is empty the server makes no outbound requests at all. Embedded metadata
+# (OPF, ID3, MP4 atoms) is always the source of truth.
+metadata_provider: ""        # GOBOOKSHELF_METADATA_PROVIDER
+metadata_allow_private: false # GOBOOKSHELF_METADATA_ALLOW_PRIVATE
