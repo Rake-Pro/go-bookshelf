@@ -69,6 +69,7 @@ All notable changes to this project are recorded here. The format follows
   supply a count.
 - Swipe left or right on the page turns it, alongside the existing tap zones,
   and the reader now respects the display cutout (safe-area) insets.
+- Go toolchain 1.27rc2 -> 1.27.0
 
 ### Fixed
 - Reader: page turn announcements are throttled instead of narrating every
