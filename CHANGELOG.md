@@ -7,6 +7,13 @@ All notable changes to this project are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Per-user library access management in the admin UI.** The Users panel now
+  shows each non-admin user's library grants as a checkbox list (backed by the
+  new `GET /api/v1/users/{id}/libraries`; saving uses the existing PUT).
+  Library visibility has always been a deny-by-default whitelist for
+  non-admins, but no UI existed to grant access - newly provisioned users
+  (including OIDC) saw empty libraries until now. Admin users show a static
+  "All libraries (admin)" note instead of a control.
 - **Adding books from the browser.** An "Add books" button on the library and
   admin pages opens a sheet with two ways in.
   - **Upload.** `POST /api/v1/libraries/{id}/upload` takes a multipart body of

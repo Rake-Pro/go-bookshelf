@@ -480,9 +480,13 @@ User state
 - `GET /me/imports` -> the import queue; see "Adding books" above
 
 Admin
-- `GET|POST /users`, `PATCH /users/{id}`, `DELETE /users/{id}`, `PUT /users/{id}/libraries`.
+- `GET|POST /users`, `PATCH /users/{id}`, `DELETE /users/{id}`,
+  `GET|PUT /users/{id}/libraries`.
   Both `POST` and `PATCH` take `can_upload`; `GET /auth/me` answers `can_upload`
   with the role already folded in, so the frontend never reimplements the rule.
+  `GET .../libraries` answers `{user_id, libraries:[id]}`, the same shape `PUT`
+  returns after a write - it is what the admin page reads to draw a user's
+  library picker in its current state.
 - `GET /system/status` -> `{version, go_version, db_path, db_size_bytes, data_dir,
   counts:{ebooks,audiobooks}, libraries, users, last_scans, oidc_enabled,
   local_login, settings_updated_at, base_url, time}`

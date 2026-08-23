@@ -225,6 +225,7 @@ export const api = {
   createUser: (data) => send('/users', data),
   updateUser: (id, patch) => send(`/users/${encodeURIComponent(id)}`, patch, 'PATCH'),
   deleteUser: (id) => request(`/users/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  userLibraries: (id) => request(`/users/${encodeURIComponent(id)}/libraries`),
   setUserLibraries: (id, libraryIds) =>
     send(`/users/${encodeURIComponent(id)}/libraries`, { libraries: libraryIds }, 'PUT'),
 

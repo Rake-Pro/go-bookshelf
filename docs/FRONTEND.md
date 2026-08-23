@@ -319,6 +319,7 @@ Notes for the backend:
 | `GET /users` | `{items:[{id, username, display_name, role, disabled_at}]}` |
 | `POST /users` | `{username, display_name, password, role, can_upload?}` |
 | `PATCH /users/{id}` | partial user |
+| `GET /users/{id}/libraries` | `{user_id, libraries:[id]}` |
 | `PUT /users/{id}/libraries` | `{libraries:[id]}` |
 | `GET /system/status` | `{version, db_driver, db_dsn (redacted), db_size_bytes (0 on Postgres), counts:{ebooks, audiobooks}, libraries, users, last_scans, oidc_enabled, local_login, settings_updated_at, base_url, ...}` |
 

@@ -13,7 +13,7 @@
  * only what a dev build uses.
  */
 
-const VERSION = 'v2';
+const VERSION = 'v3';
 const SHELL_CACHE = `bookshelf-shell-${VERSION}`;
 const COVER_CACHE = `bookshelf-covers-${VERSION}`;
 const MAX_COVERS = 400;
