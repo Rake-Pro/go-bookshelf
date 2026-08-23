@@ -306,15 +306,16 @@ function createLibraryForm(host) {
 /** @param {HTMLElement} host */
 async function renderUsers(host) {
   host.replaceChildren(loadingView('Loading users'));
-  let data;
+  let data, libData;
   try {
-    data = await api.users();
+    [data, libData] = await Promise.all([api.users(), api.libraries()]);
   } catch (e) {
     host.replaceChildren(errorView(e, () => renderUsers(host)));
     return;
   }
   const c = card('Users');
   const list = data?.items || [];
+  const libraries = libData?.items || [];
 
   const table = document.createElement('ul');
   table.className = 'linklist';
@@ -336,7 +337,7 @@ async function renderUsers(host) {
     const sp = document.createElement('span');
     sp.className = 'spacer';
     row.append(sp, uploadToggle(u, host));
-    li.append(row);
+    li.append(row, libraryAccessField(u, libraries));
     table.append(li);
   }
   if (list.length) c.append(table);
@@ -384,6 +385,101 @@ function uploadToggle(u, host) {
   });
   wrap.append(cb, text);
   return wrap;
+}
+
+/**
+ * The per-account library access picker. An administrator sees every
+ * library regardless of what is granted, so the control states that instead
+ * of offering a choice that would never change anything. A restricted or
+ * ordinary account with nothing granted here sees no books anywhere in the
+ * app, which is worth spelling out rather than leaving the admin to infer it
+ * from an empty library page.
+ *
+ * @param {any} u @param {any[]} libraries
+ */
+function libraryAccessField(u, libraries) {
+  const wrap = document.createElement('div');
+  wrap.className = 'field';
+  wrap.style.marginTop = 0;
+  const label = document.createElement('span');
+  label.className = 'label';
+  label.textContent = 'Libraries';
+  wrap.append(label);
+
+  if (u.role === 'admin') {
+    const note = document.createElement('span');
+    note.className = 'muted small';
+    note.textContent = 'All libraries (admin)';
+    wrap.append(note);
+    return wrap;
+  }
+
+  if (!libraries.length) {
+    const note = document.createElement('span');
+    note.className = 'muted small';
+    note.textContent = 'No libraries exist yet.';
+    wrap.append(note);
+    return wrap;
+  }
+
+  const body = document.createElement('div');
+  body.append(loadingView('Loading access'));
+  wrap.append(body);
+  loadLibraryAccess(u, libraries, body);
+  return wrap;
+}
+
+/** @param {any} u @param {any[]} libraries @param {HTMLElement} body */
+async function loadLibraryAccess(u, libraries, body) {
+  let granted;
+  try {
+    const data = await api.userLibraries(u.id);
+    granted = new Set(data?.libraries || []);
+  } catch (e) {
+    body.replaceChildren(errorView(e, () => loadLibraryAccess(u, libraries, body)));
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'row';
+  list.style.flexWrap = 'wrap';
+  const boxes = libraries.map((lib) => {
+    const row = document.createElement('label');
+    row.className = 'check';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = granted.has(lib.id);
+    const text = document.createElement('span');
+    text.className = 'small';
+    text.textContent = lib.name;
+    row.append(cb, text);
+    list.append(row);
+    return { id: lib.id, cb };
+  });
+
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.className = 'btn';
+  save.textContent = 'Save';
+  const out = document.createElement('div');
+
+  save.addEventListener('click', async () => {
+    save.disabled = true;
+    out.replaceChildren();
+    const ids = boxes.filter((b) => b.cb.checked).map((b) => b.id);
+    try {
+      await api.setUserLibraries(u.id, ids);
+      out.replaceChildren(flash(ids.length
+        ? `${u.username} can see ${ids.length} librar${ids.length === 1 ? 'y' : 'ies'}.`
+        : `${u.username} has no library access and will see no books.`));
+    } catch (err) {
+      out.replaceChildren(flash(errorMessage(err), 'error'));
+    } finally {
+      save.disabled = false;
+    }
+  });
+
+  body.replaceChildren(list, save, out);
 }
 
 /** @param {HTMLElement} host */

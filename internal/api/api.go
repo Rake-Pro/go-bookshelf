@@ -305,6 +305,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+p+"/users", a.createUser)
 	mux.HandleFunc("PATCH "+p+"/users/{id}", a.patchUser)
 	mux.HandleFunc("DELETE "+p+"/users/{id}", a.deleteUser)
+	mux.HandleFunc("GET "+p+"/users/{id}/libraries", a.getUserLibraries)
 	mux.HandleFunc("PUT "+p+"/users/{id}/libraries", a.putUserLibraries)
 	mux.HandleFunc("GET "+p+"/system/status", a.systemStatus)
 }

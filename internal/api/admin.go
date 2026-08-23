@@ -167,6 +167,33 @@ func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+// getUserLibraries returns the library ids a user currently has access to, so
+// the admin page can show a picker's initial state. An administrator's answer
+// is every library, the same rule listLibraries and allowedLibraries apply;
+// the admin UI never calls this for an admin account, since the answer never
+// varies, but the handler stays correct for a client that does.
+func (a *API) getUserLibraries(w http.ResponseWriter, r *http.Request) {
+	if requireAdmin(w, r) == nil {
+		return
+	}
+	userID, ok := pathID(r, "id")
+	if !ok {
+		writeError(w, http.StatusBadRequest, codeBadRequest, "user id must be a positive integer")
+		return
+	}
+	user, err := a.auth.UserByID(r.Context(), userID)
+	if err != nil {
+		fail(w, err, "library access")
+		return
+	}
+	ids, err := a.auth.LibraryIDs(r.Context(), user)
+	if err != nil {
+		fail(w, err, "library access")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"user_id": userID, "libraries": ids})
+}
+
 func (a *API) putUserLibraries(w http.ResponseWriter, r *http.Request) {
 	if requireAdmin(w, r) == nil {
 		return

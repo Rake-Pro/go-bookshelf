@@ -689,6 +689,20 @@ func TestFrontendContract(t *testing.T) {
 		t.Errorf("assigned libraries = %s", assign.Body.String())
 	}
 
+	// The admin page's library picker reads this back to draw its initial state.
+	granted := h.do(http.MethodGet, "/api/v1/users/"+itoa(newUser.ID)+"/libraries", nil, withCookie(sid))
+	if granted.Code != http.StatusOK {
+		t.Fatalf("get user libraries = %d: %s", granted.Code, granted.Body.String())
+	}
+	var grantedBody struct {
+		UserID    int64   `json:"user_id"`
+		Libraries []int64 `json:"libraries"`
+	}
+	decode(t, granted, &grantedBody)
+	if grantedBody.UserID != newUser.ID || len(grantedBody.Libraries) != 1 || grantedBody.Libraries[0] != libID {
+		t.Errorf("get user libraries = %s", granted.Body.String())
+	}
+
 	/* ---- 15. OPDS with an API token ---- */
 
 	tokenRec := h.do(http.MethodPost, "/api/v1/me/tokens",
