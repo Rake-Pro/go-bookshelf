@@ -9,6 +9,7 @@ import { player } from '../player.js';
 import { coverUrl } from '../api.js';
 import { icon, iconButton } from './icons.js';
 import { clock, names, peopleOf } from '../format.js';
+import { router } from '../router.js';
 
 const css = new CSSStyleSheet();
 css.replaceSync(`
@@ -80,6 +81,8 @@ button.play {
 export class MiniPlayer extends HTMLElement {
   #els = /** @type {any} */ ({});
   #wired = false;
+  /** Last values written to the DOM, so a `time` tick only moves the clock. */
+  #last = /** @type {{id?:string, playing?:boolean, sub?:string, time?:string}} */ ({});
 
   constructor() {
     super();
@@ -141,29 +144,55 @@ export class MiniPlayer extends HTMLElement {
       for (const ev of ['load', 'state', 'time', 'chapter']) {
         player.addEventListener(ev, () => this.#render());
       }
+      // Route changes decide whether the bar duplicates the full player. Every
+      // navigation, popstate included, goes through the router's resolve step,
+      // so one listener covers them all; the element lives as long as the app.
+      router.addEventListener('navigate', () => this.#render());
     }
     this.#render();
   }
 
   #render() {
     const it = player.item;
-    this.hidden = !it;
+    const href = it ? `/listen/${encodeURIComponent(it.id)}` : '';
+    // On the item's own player page the bar would be a second copy of the same
+    // transport, right underneath it.
+    this.hidden = !it || location.pathname.replace(/\/+$/, '') === href;
     if (!it) return;
+
     const e = this.#els;
-    const src = coverUrl(it.id, 'thumb');
-    if (e.img.getAttribute('src') !== src) e.img.setAttribute('src', src);
-    e.open.href = `/listen/${encodeURIComponent(it.id)}`;
-    e.open.setAttribute('aria-label', `Open player for ${it.title}`);
-    e.t.textContent = it.title || '';
-    const sub = player.chapter?.title || names(peopleOf(it, 'author'));
-    e.s.textContent = sub;
-    e.time.textContent = `${clock(player.position)} / ${clock(player.duration)}`;
-    const playing = player.playing;
-    e.play.setAttribute('aria-label', playing ? 'Pause' : 'Play');
-    e.play.title = playing ? 'Pause' : 'Play';
-    e.play.replaceChildren(icon(playing ? 'pause' : 'play'));
+    // `time` fires ~4x a second: only the clock and the progress fill may be
+    // written on every tick, everything else is dirty-checked.
+    const time = `${clock(player.position)} / ${clock(player.duration)}`;
+    if (time !== this.#last.time) {
+      this.#last.time = time;
+      e.time.textContent = time;
+    }
     e.fill.style.width = player.duration
       ? `${Math.min(100, (player.position / player.duration) * 100)}%` : '0%';
+
+    if (it.id !== this.#last.id) {
+      this.#last.id = it.id;
+      const src = coverUrl(it.id, 'thumb');
+      if (e.img.getAttribute('src') !== src) e.img.setAttribute('src', src);
+      e.open.href = href;
+      e.open.setAttribute('aria-label', `Open player for ${it.title}`);
+      e.t.textContent = it.title || '';
+    }
+
+    const sub = player.chapter?.title || names(peopleOf(it, 'author'));
+    if (sub !== this.#last.sub) {
+      this.#last.sub = sub;
+      e.s.textContent = sub;
+    }
+
+    const playing = player.playing;
+    if (playing !== this.#last.playing) {
+      this.#last.playing = playing;
+      e.play.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+      e.play.title = playing ? 'Pause' : 'Play';
+      e.play.replaceChildren(icon(playing ? 'pause' : 'play'));
+    }
   }
 }
 

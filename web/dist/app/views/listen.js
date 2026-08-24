@@ -18,7 +18,7 @@ import { openSheet } from '../components/sheet.js';
 import { loadingView, errorView } from '../components/states.js';
 import { clock, duration, names, peopleOf, spokenDuration } from '../format.js';
 import { announce } from '../live.js';
-import { navigate } from '../router.js';
+import { navigate, router } from '../router.js';
 
 const SPEED_PRESETS = [1, 1.25, 1.5, 2];
 const SLEEP_PRESETS = [15, 30, 45, 60];
@@ -33,7 +33,7 @@ export default async function listen(ctx) {
   try {
     item = await api.item(ctx.params.id);
   } catch (e) {
-    el.replaceChildren(errorView(e, () => navigate(location.pathname, { replace: true })));
+    el.replaceChildren(errorView(e, () => router.refresh()));
     return { el, title: 'Player' };
   }
 
@@ -67,29 +67,58 @@ export default async function listen(ctx) {
   const chapterName = document.createElement('p');
   chapterName.className = 'player-chapter';
 
-  /* --- scrubber --- */
+  /* --- scrubber ---
+     Scoped to the chapter whenever there is more than one: a nine-hour book
+     across ~330px of track is about 100 seconds per pixel, which makes a small
+     correction impossible. The value stays an absolute position, so nothing
+     downstream has to know about the scoping; only min/max move. The whole-book
+     picture stays in the times row either side of the chapter clock. */
   const scrub = document.createElement('input');
   scrub.type = 'range';
+  scrub.className = 'range-touch';
   scrub.min = '0';
   scrub.max = String(Math.max(1, player.duration));
   scrub.step = '1000';
   scrub.value = '0';
   scrub.setAttribute('aria-label', 'Playback position');
 
+  const SCRUB_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown']);
   let scrubbing = false;
   scrub.addEventListener('pointerdown', () => { scrubbing = true; });
-  scrub.addEventListener('keydown', () => { scrubbing = true; });
+  scrub.addEventListener('keydown', (e) => { if (SCRUB_KEYS.has(e.key)) scrubbing = true; });
   scrub.addEventListener('change', () => {
     scrubbing = false;
-    player.seek(Number(scrub.value));
+    // The chapter bounds already keep the range inside the book, but a stale
+    // max (a chapter list jump landing mid-drag) must not send a seek past the
+    // last track either.
+    player.seek(clamp(Number(scrub.value), 0, Math.max(0, player.duration)));
+    // Releasing is also when the bounds frozen during the drag catch up.
+    render();
   });
+  scrub.addEventListener('blur', () => {
+    if (!scrubbing) return;
+    scrubbing = false;
+    render();
+  });
+  // A press released on the same pixel fires neither input nor change, and
+  // the range keeps focus, so pointerup/pointercancel must also unfreeze.
+  for (const ev of ['pointerup', 'pointercancel']) {
+    scrub.addEventListener(ev, () => {
+      if (!scrubbing) return;
+      scrubbing = false;
+      render();
+    });
+  }
   scrub.addEventListener('input', () => { times(); });
 
   const timeRow = document.createElement('div');
   timeRow.className = 'player-times';
   const elapsed = document.createElement('span');
+  const chapterTime = document.createElement('span');
+  chapterTime.className = 'player-chapter-time';
+  chapterTime.title = 'Position in this chapter';
   const remaining = document.createElement('span');
-  timeRow.append(elapsed, remaining);
+  timeRow.append(elapsed, chapterTime, remaining);
 
   /* --- transport --- */
   const transport = document.createElement('div');
@@ -151,42 +180,116 @@ export default async function listen(ctx) {
 
   /* --- rendering --- */
 
+  /**
+   * The chapter the scrubber is currently scoped to, or null while it spans the
+   * whole book. Held rather than recomputed so the bounds and the readouts
+   * cannot disagree: playback carries on during a drag and can cross into the
+   * next chapter, and the slider under the thumb must not move with it.
+   * @type {{title:string, start:number, end:number}|null}
+   */
+  let scope = null;
+  let lastScrubLabel = '';
+
+  /**
+   * Point min/max at the current chapter, or at the whole book when there are
+   * fewer than two chapters to scope to. Both ends are clamped into the book,
+   * so no value the slider can produce seeks outside the track list. A drag in
+   * progress keeps the bounds it started with; the release re-runs this.
+   */
+  function applyBounds() {
+    if (scrubbing) return;
+    const total = Math.max(1, player.duration);
+    const c = player.chapters.length > 1 ? player.chapter : null;
+    // A chapter shorter than a couple of steps has nothing to scope to, and a
+    // min equal to its max would leave the slider stuck. A position outside
+    // the chapter's own bounds (an intro before the first mark, credits past
+    // the last) must not be scoped either: the browser would clamp the value
+    // to the nearer bound, pinning the thumb and making a release seek there.
+    const pos = player.position;
+    scope = c && c.end - c.start >= 2000 && pos >= c.start && pos <= c.end ? c : null;
+    const lo = scope ? clamp(scope.start, 0, total) : 0;
+    const hi = scope ? clamp(scope.end, lo, total) : total;
+    if (scrub.min !== String(lo)) scrub.min = String(lo);
+    if (scrub.max !== String(hi)) scrub.max = String(hi);
+    const label = scope ? 'Playback position in chapter' : 'Playback position';
+    if (label !== lastScrubLabel) {
+      lastScrubLabel = label;
+      scrub.setAttribute('aria-label', label);
+    }
+  }
+
   function times() {
     const pos = scrubbing ? Number(scrub.value) : player.position;
     elapsed.textContent = clock(pos);
     remaining.textContent = `-${clock(Math.max(0, player.duration - pos))}`;
-    scrub.setAttribute('aria-valuetext',
-      `${spokenDuration(pos)} of ${spokenDuration(player.duration)}`);
+
+    const book = `${spokenDuration(pos)} of ${spokenDuration(player.duration)}`;
+    let chapterClock = '';
+    let spoken = book;
+    if (scope) {
+      const len = Math.max(0, scope.end - scope.start);
+      const into = clamp(pos - scope.start, 0, len);
+      chapterClock = `${clock(into)} / ${clock(len)}`;
+      spoken = `${spokenDuration(into)} of ${spokenDuration(len)} in ${scope.title}, `
+        + `${book} in the book`;
+    }
+    if (chapterTime.textContent !== chapterClock) chapterTime.textContent = chapterClock;
+    if (scrub.getAttribute('aria-valuetext') !== spoken) {
+      scrub.setAttribute('aria-valuetext', spoken);
+    }
   }
 
+  // `time` fires ~4x a second. Rebuilding the play icon and rewriting the aria
+  // labels on every tick is DOM churn a screen reader hears as a stream of
+  // changes, so anything that only changes on a state change is dirty-checked;
+  // per-tick work stays the time text and the slider position.
+  let lastPlaying = /** @type {boolean|null} */ (null);
+  let lastSpeed = /** @type {number|null} */ (null);
+  let lastSkips = '';
+
   function render() {
-    scrub.max = String(Math.max(1, player.duration));
+    applyBounds();
     if (!scrubbing) scrub.value = String(Math.min(player.duration, player.position));
     times();
 
     const playing = player.playing;
-    playBtn.replaceChildren(icon(playing ? 'pause' : 'play'));
-    playBtn.setAttribute('aria-label', playing ? 'Pause' : 'Play');
-    playBtn.title = playing ? 'Pause' : 'Play';
+    if (playing !== lastPlaying) {
+      lastPlaying = playing;
+      playBtn.replaceChildren(icon(playing ? 'pause' : 'play'));
+      playBtn.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+      playBtn.title = playing ? 'Pause' : 'Play';
+    }
 
     const c = player.chapter;
-    chapterName.textContent = c
+    const chapterText = c
       ? `${c.title} (${player.chapterIndex + 1} of ${player.chapters.length})`
       : '';
+    if (chapterName.textContent !== chapterText) chapterName.textContent = chapterText;
 
-    speedBtn.replaceChildren(icon('speed'));
-    const sl = document.createElement('span');
-    sl.textContent = `${trim(store.player.speed)}x`;
-    speedBtn.append(sl);
-    speedBtn.setAttribute('aria-label', `Playback speed, currently ${trim(store.player.speed)} times`);
+    const speed = store.player.speed;
+    if (speed !== lastSpeed) {
+      lastSpeed = speed;
+      speedBtn.replaceChildren(icon('speed'));
+      const sl = document.createElement('span');
+      sl.textContent = `${trim(speed)}x`;
+      speedBtn.append(sl);
+      speedBtn.setAttribute('aria-label', `Playback speed, currently ${trim(speed)} times`);
+    }
 
-    if (player.sleepEndOfChapter) sleepLabel.textContent = 'End of chapter';
-    else if (player.sleepAt) sleepLabel.textContent = `${Math.ceil(player.sleepRemainingMs / 60000)}m`;
-    else sleepLabel.textContent = 'Sleep';
-    sleepBtn.setAttribute('aria-label', `Sleep timer: ${sleepLabel.textContent}`);
+    let sleepText = 'Sleep';
+    if (player.sleepEndOfChapter) sleepText = 'End of chapter';
+    else if (player.sleepAt) sleepText = `${Math.ceil(player.sleepRemainingMs / 60000)}m`;
+    if (sleepLabel.textContent !== sleepText) {
+      sleepLabel.textContent = sleepText;
+      sleepBtn.setAttribute('aria-label', `Sleep timer: ${sleepText}`);
+    }
 
-    backBtn.setAttribute('aria-label', `Skip back ${store.player.skip_back_s} seconds`);
-    fwdBtn.setAttribute('aria-label', `Skip forward ${store.player.skip_fwd_s} seconds`);
+    const skips = `${store.player.skip_back_s}/${store.player.skip_fwd_s}`;
+    if (skips !== lastSkips) {
+      lastSkips = skips;
+      backBtn.setAttribute('aria-label', `Skip back ${store.player.skip_back_s} seconds`);
+      fwdBtn.setAttribute('aria-label', `Skip forward ${store.player.skip_fwd_s} seconds`);
+    }
   }
 
   /** @type {[string, () => void][]} */
@@ -346,6 +449,8 @@ export default async function listen(ctx) {
 /** 1.25 -> "1.25", 2 -> "2" */
 const trim = (n) => String(Number(n.toFixed(2)));
 
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+
 function style() {
   const s = document.createElement('style');
   s.textContent = `
@@ -359,8 +464,10 @@ function style() {
 }
 .player h1 { margin: var(--s4) 0 0; font-size: 1.35rem; }
 .player p { margin: 0; }
+/* Bounded by height as well as width: on a 360x640 phone an 18rem square
+   pushed the play button below the fold. */
 .player-cover {
-  width: min(18rem, 70vw);
+  width: min(18rem, 70vw, 38dvh);
   aspect-ratio: 1 / 1;
   object-fit: cover;
   background: var(--surface-2);
@@ -372,11 +479,18 @@ function style() {
 .player-times {
   display: flex;
   justify-content: space-between;
+  gap: var(--s2);
   width: 100%;
   font-variant-numeric: tabular-nums;
   color: var(--muted);
   font-size: 0.9rem;
 }
+/* Position inside the chapter the scrubber is scoped to, between the book's
+   own elapsed and remaining. Empty, and so invisible, on a book with no
+   chapters to scope to. The narrowest phones give the two book clocks the
+   room instead. */
+.player-chapter-time { flex: none; }
+@media (max-width: 22rem) { .player-chapter-time { display: none; } }
 .player-transport {
   display: flex;
   align-items: center;
@@ -404,6 +518,29 @@ function style() {
   justify-content: center;
   gap: var(--s2);
   margin-top: var(--s4);
+}
+
+/* A phone on its side has no room for a stacked player: cover to the left,
+   everything you actually touch to the right, the same split .item-hero uses
+   once there is width for it. */
+@media (orientation: landscape) and (max-height: 30rem) {
+  .player {
+    /* One row per control, so the cover can span them all: "1 / -1" only
+       reaches the end of the explicit grid. */
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: repeat(7, auto);
+    justify-items: stretch;
+    align-items: center;
+    column-gap: var(--s6);
+    max-width: 48rem;
+    text-align: left;
+  }
+  .player-cover { grid-column: 1; grid-row: 1 / -1; width: min(14rem, 42vw, 60dvh); }
+  .player > :not(.player-cover) { grid-column: 2; }
+  .player h1 { margin: 0; font-size: 1.15rem; }
+  .player input[type="range"] { margin-top: var(--s2); }
+  .player-transport { justify-content: center; margin-top: 0; }
+  .player-tools { justify-content: flex-start; margin-top: var(--s2); }
 }
 `;
   return s;

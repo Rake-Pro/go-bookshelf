@@ -13,6 +13,7 @@ import { announce } from '../live.js';
 import { addBooksButton } from '../components/add-books.js';
 import { confirmDialog } from '../components/confirm.js';
 
+
 /** @param {import('../router.js').RouteCtx} ctx */
 export default async function admin(ctx) {
   const settingsLink = document.createElement('a');
@@ -21,6 +22,10 @@ export default async function admin(ctx) {
   settingsLink.textContent = 'Settings';
 
   const { el, body } = page('Admin', { actions: [settingsLink] });
+  // Scan-status poll timers for THIS mount, keyed by library id. Per-mount so
+  // an overlapping admin mount's destroy cannot clear the new mount's polls.
+  const scanTimers = new Map();
+  const destroy = () => { for (const t of scanTimers.values()) clearTimeout(t); scanTimers.clear(); };
 
   if (!store.isAdmin) {
     body.replaceChildren(emptyView(
@@ -28,7 +33,7 @@ export default async function admin(ctx) {
       'Your account does not have permission to manage this server.',
       { label: 'Go home', href: '/' },
     ));
-    return { el, title: 'Admin' };
+    return { el, title: 'Admin', destroy };
   }
 
   const libs = document.createElement('section');
@@ -36,11 +41,11 @@ export default async function admin(ctx) {
   const status = document.createElement('section');
   body.append(libs, users, status);
 
-  renderLibraries(libs);
+  renderLibraries(libs, scanTimers);
   renderUsers(users);
   renderStatus(status);
 
-  return { el, title: 'Admin' };
+  return { el, title: 'Admin', destroy };
 }
 
 /** @param {string} title */
@@ -60,7 +65,7 @@ function flash(msg, kind = 'ok') {
   p.setAttribute('role', 'status');
   p.className = 'row small';
   p.style.color = kind === 'ok' ? 'var(--ok)' : 'var(--danger)';
-  p.append(icon(kind === 'ok' ? 'check' : 'warn'), document.createTextNode(msg));
+  p.append(icon(kind === 'ok' ? 'check' : 'warn', { size: '1.25rem' }), document.createTextNode(msg));
   announce(msg);
   return p;
 }
@@ -68,13 +73,13 @@ function flash(msg, kind = 'ok') {
 /* ---------------- libraries ---------------- */
 
 /** @param {HTMLElement} host */
-async function renderLibraries(host) {
+async function renderLibraries(host, timers) {
   host.replaceChildren(loadingView('Loading libraries'));
   let data;
   try {
     data = await api.libraries();
   } catch (e) {
-    host.replaceChildren(errorView(e, () => renderLibraries(host)));
+    host.replaceChildren(errorView(e, () => renderLibraries(host, timers)));
     return;
   }
 
@@ -86,13 +91,13 @@ async function renderLibraries(host) {
   } else {
     const ul = document.createElement('ul');
     ul.className = 'linklist';
-    for (const lib of list) ul.append(libraryRow(lib, host));
+    for (const lib of list) ul.append(libraryRow(lib, host, timers));
     c.append(ul);
   }
 
   // Adding books is not an admin power, but the admin page is where the
   // libraries are, so the same button lives here too.
-  const add = addBooksButton({ libraries: list, onAdded: () => renderLibraries(host) });
+  const add = addBooksButton({ libraries: list, onAdded: () => renderLibraries(host, timers) });
   if (add) {
     const row = document.createElement('div');
     row.className = 'row';
@@ -101,12 +106,12 @@ async function renderLibraries(host) {
     c.append(row);
   }
 
-  c.append(createLibraryForm(host));
+  c.append(createLibraryForm(host, timers));
   host.replaceChildren(c);
 }
 
 /** @param {any} lib @param {HTMLElement} host */
-function libraryRow(lib, host) {
+function libraryRow(lib, host, timers) {
   const li = document.createElement('li');
   li.style.padding = 'var(--s3) 0';
   li.style.borderBottom = '1px solid var(--border)';
@@ -143,71 +148,295 @@ function libraryRow(lib, host) {
   result.style.marginTop = 'var(--s2)';
 
   scan.addEventListener('click', async () => {
+    if (scan.disabled) return;
     scan.disabled = true;
     scanLabel.textContent = 'Scanning...';
-    result.replaceChildren();
+    // The region goes live only once a scan was asked for: page load writes
+    // the last-scan summary in here too, and a live region would read every
+    // library's history aloud unprompted. The paired announce() covers the
+    // first write, which lands in the same tick the region is registered.
+    if (!result.hasAttribute('role')) {
+      result.setAttribute('role', 'status');
+      result.setAttribute('aria-live', 'polite');
+    }
+    result.replaceChildren(scanLine('Scan started.'));
+    announce('Scan started');
     try {
       await api.scanLibrary(lib.id);
-      result.replaceChildren(flash('Scan started.'));
-      pollScans(lib.id, result);
+      pollScans(lib.id, result, timers, scan, scanLabel);
     } catch (e) {
-      result.replaceChildren(flash(errorMessage(e), 'error'));
-    } finally {
+      result.replaceChildren(scanLine(errorMessage(e), 'error'));
       scan.disabled = false;
       scanLabel.textContent = 'Scan';
     }
   });
 
   top.append(name, sp, browse, scan);
-  li.append(top, result);
-  loadLastScan(lib.id, result);
+  li.append(top, result, libraryEditDetails(lib, strong, sub), libraryDeleteControl(lib, host, timers));
+  loadLastScan(lib.id, result, timers, scan, scanLabel);
   return li;
 }
 
-/** @param {string} id @param {HTMLElement} host */
-async function loadLastScan(id, host) {
+/**
+ * The scan status line, written into the library row's own always-present
+ * live region (never a freshly role="status" node of its own - a screen
+ * reader is not guaranteed to pick up a role landing on a node that is itself
+ * being swapped in).
+ * @param {string} text @param {'ok'|'error'} [kind]
+ */
+function scanLine(text, kind) {
+  const p = document.createElement('p');
+  p.className = kind ? 'row small' : 'muted small';
+  p.style.margin = '0';
+  if (kind) {
+    p.style.color = kind === 'ok' ? 'var(--ok)' : 'var(--danger)';
+    p.append(icon(kind === 'ok' ? 'check' : 'warn', { size: '1.25rem' }));
+  }
+  p.append(document.createTextNode(text));
+  return p;
+}
+
+/** @param {any} s @returns {string} */
+function scanSummaryText(s) {
+  return s.finished_at
+    ? `Last scan ${date(s.finished_at)}: ${s.added ?? 0} added, ${s.updated ?? 0} updated, `
+      + `${s.removed ?? 0} removed, ${s.errors ?? 0} errors`
+    : `Scan running since ${date(s.started_at)}`;
+}
+
+/**
+ * @param {string} id @param {HTMLElement} host @param {Map<string, number>} timers
+ * @param {HTMLButtonElement} [scanBtn] @param {HTMLElement} [scanLabel]
+ */
+async function loadLastScan(id, host, timers, scanBtn, scanLabel) {
   try {
     const data = await api.scans(id);
     const last = (data?.items || [])[0];
     if (!last) return;
-    host.replaceChildren(scanSummary(last));
+    const text = scanSummaryText(last);
+    if (host.textContent !== text) host.replaceChildren(scanLine(text));
+    // A scan started elsewhere (another tab, another admin) is still worth
+    // watching, so pick up polling rather than leaving the row to freeze.
+    if (!last.finished_at) {
+      if (scanBtn) { scanBtn.disabled = true; scanLabel.textContent = 'Scanning...'; }
+      pollScans(id, host, timers, scanBtn, scanLabel);
+    }
   } catch { /* scan history is optional detail */ }
 }
 
-/** @param {any} s */
-function scanSummary(s) {
-  const p = document.createElement('p');
-  p.className = 'muted small';
-  p.style.margin = '0';
-  const running = !s.finished_at;
-  p.textContent = running
-    ? `Scan running since ${date(s.started_at)}`
-    : `Last scan ${date(s.finished_at)}: ${s.added ?? 0} added, ${s.updated ?? 0} updated, `
-      + `${s.removed ?? 0} removed, ${s.errors ?? 0} errors`;
-  return p;
-}
+/**
+ * Poll scan status until it finishes (or 60 tries, ~2 minutes). Cancels any
+ * poll already running for this library, and stops on its own once the host
+ * row leaves the document (a navigation away from /admin).
+ * @param {string} id @param {HTMLElement} host @param {Map<string, number>} timers
+ * @param {HTMLButtonElement} [scanBtn] @param {HTMLElement} [scanLabel]
+ */
+function pollScans(id, host, timers, scanBtn, scanLabel) {
+  const prev = timers.get(id);
+  if (prev) clearTimeout(prev);
 
-/** Poll scan status until it finishes (or 60 tries, ~2 minutes). */
-function pollScans(id, host) {
+  /** Both a finish and a give-up hand the button back. */
+  const release = () => { if (scanBtn) { scanBtn.disabled = false; scanLabel.textContent = 'Scan'; } };
+
   let tries = 0;
   const tick = async () => {
+    if (!host.isConnected) { timers.delete(id); return; }
     tries++;
     try {
       const data = await api.scans(id);
       const last = (data?.items || [])[0];
-      if (last) host.replaceChildren(scanSummary(last));
       if (last && last.finished_at) {
-        announce('Scan finished');
+        timers.delete(id);
+        host.replaceChildren(scanLine(scanSummaryText(last), 'ok'));
+        release();
         return;
       }
+      if (last) {
+        // Same text, same nodes: rewriting a live region re-announces it, so
+        // only touch it when the status actually changed.
+        const text = scanSummaryText(last);
+        if (host.textContent !== text) host.replaceChildren(scanLine(text));
+      }
     } catch { /* keep polling */ }
-    if (tries < 60) setTimeout(tick, 2000);
+    if (tries < 60) {
+      // Re-check after the await: the row can leave the document mid-request.
+      if (!host.isConnected) { timers.delete(id); return; }
+      timers.set(id, setTimeout(tick, 2000));
+      return;
+    }
+    timers.delete(id);
+    const line = scanLine('Still scanning - this is taking longer than expected.');
+    const refresh = document.createElement('button');
+    refresh.type = 'button';
+    refresh.className = 'btn btn--quiet';
+    refresh.textContent = 'Refresh';
+    refresh.addEventListener('click', () => loadLastScan(id, host, timers, scanBtn, scanLabel));
+    line.append(refresh);
+    host.replaceChildren(line);
+    release();
   };
-  setTimeout(tick, 2000);
+  timers.set(id, setTimeout(tick, 2000));
+}
+
+/**
+ * Name, kind and paths - everything `PATCH /libraries/{id}` accepts, in one
+ * form. Saves only the changed fields and, on success, updates the row's own
+ * name/sub line in place rather than re-rendering the whole panel, so an
+ * in-flight scan poll for this row (or any other) is left running untouched.
+ *
+ * @param {any} lib @param {HTMLElement} strong @param {HTMLElement} sub
+ */
+function libraryEditDetails(lib, strong, sub) {
+  const details = document.createElement('details');
+  details.style.marginTop = 'var(--s2)';
+  const summary = document.createElement('summary');
+  summary.className = 'btn';
+  summary.style.display = 'inline-flex';
+  summary.append(icon('gear'));
+  const st = document.createElement('span');
+  st.textContent = 'Edit';
+  summary.append(st);
+  details.append(summary);
+
+  const form = document.createElement('form');
+  form.style.marginTop = 'var(--s4)';
+  form.noValidate = true;
+
+  const nameField = textField('Name', 'name', '');
+  const nameInput = /** @type {HTMLInputElement} */ (nameField.querySelector('input'));
+  nameInput.value = lib.name;
+
+  const kindField = document.createElement('label');
+  kindField.className = 'field';
+  const kindLabel = document.createElement('span');
+  kindLabel.className = 'label';
+  kindLabel.textContent = 'Kind';
+  const kindSelect = document.createElement('select');
+  kindSelect.name = 'kind';
+  for (const [v, t] of [['ebook', 'Ebooks'], ['audiobook', 'Audiobooks'], ['mixed', 'Mixed']]) {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = t;
+    if (v === lib.kind) o.selected = true;
+    kindSelect.append(o);
+  }
+  kindField.append(kindLabel, kindSelect);
+
+  const pathsField = document.createElement('label');
+  pathsField.className = 'field';
+  const pathsLabel = document.createElement('span');
+  pathsLabel.className = 'label';
+  pathsLabel.textContent = 'Paths';
+  const pathsInput = document.createElement('textarea');
+  pathsInput.name = 'paths';
+  pathsInput.value = (lib.paths || []).join('\n');
+  const pathsHint = document.createElement('span');
+  pathsHint.className = 'hint';
+  pathsHint.textContent = 'One absolute path per line, readable by the server.';
+  pathsField.append(pathsLabel, pathsInput, pathsHint);
+
+  const submit = document.createElement('button');
+  submit.type = 'submit';
+  submit.className = 'btn btn--primary';
+  submit.textContent = 'Save';
+  const out = document.createElement('div');
+
+  form.append(nameField, kindField, pathsField, submit, out);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const patch = {};
+    const newName = String(fd.get('name') || '').trim();
+    if (!newName) {
+      out.replaceChildren(flash('A name is required.', 'error'));
+      return;
+    }
+    if (newName !== lib.name) patch.name = newName;
+    const newKind = String(fd.get('kind') || lib.kind);
+    if (newKind !== lib.kind) patch.kind = newKind;
+    const newPaths = String(fd.get('paths') || '').split('\n').map((x) => x.trim()).filter(Boolean);
+    const oldPaths = lib.paths || [];
+    const pathsChanged = newPaths.length !== oldPaths.length || newPaths.some((p, i) => p !== oldPaths[i]);
+    if (pathsChanged) {
+      if (!newPaths.length) {
+        out.replaceChildren(flash('At least one path is required.', 'error'));
+        return;
+      }
+      patch.paths = newPaths;
+    }
+    if (Object.keys(patch).length === 0) {
+      out.replaceChildren(flash('No changes to save.'));
+      return;
+    }
+    submit.disabled = true;
+    out.replaceChildren();
+    try {
+      const updated = await api.updateLibrary(lib.id, patch);
+      lib.name = updated?.name ?? patch.name ?? lib.name;
+      lib.kind = updated?.kind ?? patch.kind ?? lib.kind;
+      lib.paths = updated?.paths ?? patch.paths ?? lib.paths;
+      strong.textContent = lib.name;
+      sub.textContent = `${lib.kind} - ${(lib.paths || []).join(', ') || 'no paths'}`;
+      out.replaceChildren(flash('Saved.'));
+    } catch (err) {
+      out.replaceChildren(flash(errorMessage(err), 'error'));
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  details.append(form);
+  return details;
+}
+
+/**
+ * The delete control. Confirmed via `internal/library/queries.go`
+ * `DeleteLibrary`: it only removes the `libraries` row (cascading to its
+ * items, paths, scan history and per-user grants); it never touches the
+ * filesystem, so the dialog copy says exactly that.
+ *
+ * @param {any} lib @param {HTMLElement} host
+ */
+function libraryDeleteControl(lib, host, timers) {
+  const wrap = document.createElement('div');
+  wrap.className = 'row';
+  wrap.style.marginTop = 'var(--s2)';
+
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'btn btn--danger';
+  del.append(icon('close'));
+  const label = document.createElement('span');
+  label.textContent = 'Delete';
+  del.append(label);
+  const out = document.createElement('div');
+
+  del.addEventListener('click', async () => {
+    del.disabled = true;
+    const ok = await confirmDialog(wrap, {
+      heading: 'Delete library',
+      message: `Delete library ${lib.name}? Its books leave the catalog; files on disk are not touched.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) { del.disabled = false; return; }
+    out.replaceChildren();
+    try {
+      await api.deleteLibrary(lib.id);
+      announce(`Deleted ${lib.name}`);
+      renderLibraries(host, timers);
+    } catch (err) {
+      del.disabled = false;
+      out.replaceChildren(flash(errorMessage(err), 'error'));
+    }
+  });
+
+  wrap.append(del, out);
+  return wrap;
 }
 
 /** @param {HTMLElement} host */
-function createLibraryForm(host) {
+function createLibraryForm(host, timers) {
   const details = document.createElement('details');
   details.style.marginTop = 'var(--s4)';
   const summary = document.createElement('summary');
@@ -289,7 +518,7 @@ function createLibraryForm(host) {
     submit.disabled = true;
     try {
       await api.createLibrary(body);
-      renderLibraries(host);
+      renderLibraries(host, timers);
       announce('Library created');
     } catch (err) {
       out.replaceChildren(flash(errorMessage(err), 'error'));
@@ -361,7 +590,7 @@ async function renderUsers(host) {
   if (list.length) c.append(table);
   else c.append(emptyView('No users', 'Add the first account below.'));
 
-  c.append(createUserForm(host, localLogin));
+  c.append(createUserForm(host, localLogin, oidcEnabled));
   host.replaceChildren(c);
 }
 
@@ -380,29 +609,34 @@ function uploadToggle(u, host) {
     note.textContent = u.role === 'admin' ? 'Can add books' : 'Cannot add books';
     return note;
   }
+  const box = document.createElement('div');
   const wrap = document.createElement('label');
-  wrap.className = 'check row';
+  wrap.className = 'check';
   const cb = document.createElement('input');
   cb.type = 'checkbox';
   cb.checked = u.can_upload === true;
   const text = document.createElement('span');
   text.className = 'small';
   text.textContent = 'Can add books';
+  wrap.append(cb, text);
+  const out = document.createElement('div');
+  box.append(wrap, out);
+
   cb.addEventListener('change', async () => {
     cb.disabled = true;
+    out.replaceChildren();
     try {
       await api.updateUser(u.id, { can_upload: cb.checked });
       announce(`${u.username} ${cb.checked ? 'can' : 'cannot'} add books`);
-    } catch (err) {
-      cb.checked = !cb.checked;
-      announce(errorMessage(err));
-    } finally {
       cb.disabled = false;
       renderUsers(host);
+    } catch (err) {
+      cb.checked = !cb.checked;
+      out.replaceChildren(flash(errorMessage(err), 'error'));
+      cb.disabled = false;
     }
   });
-  wrap.append(cb, text);
-  return wrap;
+  return box;
 }
 
 /**
@@ -684,6 +918,7 @@ function userDeleteControl(u, host, enabledAdmins) {
       : 'This is the last administrator; promote another account first.';
   } else {
     del.addEventListener('click', async () => {
+      del.disabled = true;
       const ok = await confirmDialog(wrap, {
         heading: 'Delete user',
         message: `Delete ${u.display_name || u.username} (${u.username})? This removes their library access, `
@@ -691,8 +926,7 @@ function userDeleteControl(u, host, enabledAdmins) {
         confirmLabel: 'Delete',
         danger: true,
       });
-      if (!ok) return;
-      del.disabled = true;
+      if (!ok) { del.disabled = false; return; }
       out.replaceChildren();
       try {
         await api.deleteUser(u.id);
@@ -709,8 +943,8 @@ function userDeleteControl(u, host, enabledAdmins) {
   return wrap;
 }
 
-/** @param {HTMLElement} host */
-function createUserForm(host, localLogin) {
+/** @param {HTMLElement} host @param {boolean} localLogin @param {boolean} oidcEnabled */
+function createUserForm(host, localLogin, oidcEnabled) {
   const details = document.createElement('details');
   details.style.marginTop = 'var(--s4)';
   const summary = document.createElement('summary');
@@ -765,6 +999,11 @@ function createUserForm(host, localLogin) {
   // greyed, and the account is created by username alone for single sign-on
   // to adopt on its first login (docs/DESIGN.md, "OIDC group mapping").
   const pwField = localLogin ? textField('Password', 'password', '', 'password') : null;
+  // With single sign-on on, a blank password is a legitimate way to
+  // pre-create an SSO-only account for someone to sign into by username.
+  if (pwField && oidcEnabled) {
+    pwField.append(hintEl('Leave blank to create an SSO-only account.'));
+  }
 
   form.append(
     textField('Username', 'username', ''),
@@ -783,9 +1022,9 @@ function createUserForm(host, localLogin) {
       role: String(fd.get('role') || 'user'),
       can_upload: fd.get('can_upload') === 'on',
     };
-    if (!body.username || (localLogin && !body.password)) {
+    if (!body.username || (localLogin && !oidcEnabled && !body.password)) {
       out.replaceChildren(flash(
-        localLogin ? 'Username and password are required.' : 'Username is required.', 'error'));
+        localLogin && !oidcEnabled ? 'Username and password are required.' : 'Username is required.', 'error'));
       return;
     }
     submit.disabled = true;
@@ -808,6 +1047,7 @@ function createUserForm(host, localLogin) {
 
 /** @param {HTMLElement} host */
 async function renderStatus(host) {
+  host.replaceChildren(loadingView('Loading server status'));
   try {
     const s = await api.systemStatus();
     const c = card('Server');
@@ -844,8 +1084,8 @@ async function renderStatus(host) {
     link.textContent = 'Edit settings';
     c.append(link);
     host.replaceChildren(c);
-  } catch {
-    host.replaceChildren();
+  } catch (e) {
+    host.replaceChildren(errorView(e, () => renderStatus(host)));
   }
 }
 

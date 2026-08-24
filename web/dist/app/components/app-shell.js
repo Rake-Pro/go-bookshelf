@@ -77,6 +77,13 @@ export function createShell() {
 
   shell.append(appbar, sidebar, main, dock);
 
+  // main.content only reserves space for the mini-player while it is
+  // actually shown; the player toggles its own [hidden] attribute, so watch
+  // that rather than duplicating its visibility logic here.
+  const syncMiniPlayerSpace = () => main.classList.toggle('has-miniplayer', !mini.hidden);
+  new MutationObserver(syncMiniPlayerSpace).observe(mini, { attributes: true, attributeFilter: ['hidden'] });
+  syncMiniPlayerSpace();
+
   /** @type {HTMLAnchorElement[]} */
   let links = [];
 

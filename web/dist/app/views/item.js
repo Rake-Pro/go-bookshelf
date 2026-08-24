@@ -11,7 +11,7 @@ import { icon } from '../components/icons.js';
 import { confirmDialog } from '../components/confirm.js';
 import { duration, clock, peopleOf, seriesOf, percent, date, bytes } from '../format.js';
 import { player } from '../player.js';
-import { navigate } from '../router.js';
+import { navigate, router } from '../router.js';
 import { store } from '../store.js';
 import { announce } from '../live.js';
 
@@ -24,7 +24,7 @@ export default async function itemView(ctx) {
   try {
     item = await api.item(ctx.params.id);
   } catch (e) {
-    el.replaceChildren(errorView(e, () => navigate(location.pathname, { replace: true })));
+    el.replaceChildren(errorView(e, () => router.refresh()));
     return { el, title: 'Item' };
   }
   if (!item) {
@@ -124,14 +124,14 @@ export default async function itemView(ctx) {
     delLabel.textContent = 'Delete';
     del.append(delLabel);
     del.addEventListener('click', async () => {
+      del.disabled = true;
       const ok = await confirmDialog(el, {
         heading: 'Delete book',
         message: `Delete "${item.title}"? This removes its file(s) from disk. This cannot be undone.`,
         confirmLabel: 'Delete',
         danger: true,
       });
-      if (!ok) return;
-      del.disabled = true;
+      if (!ok) { del.disabled = false; return; }
       deleteError.hidden = true;
       try {
         await api.deleteItem(item.id);

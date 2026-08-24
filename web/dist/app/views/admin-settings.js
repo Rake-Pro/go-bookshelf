@@ -34,13 +34,19 @@ export default async function adminSettings() {
     return { el, title: 'Settings' };
   }
 
+  await load(body);
+  return { el, title: 'Settings' };
+}
+
+/** @param {HTMLElement} body */
+async function load(body) {
   body.replaceChildren(loadingView('Loading settings'));
   let settings;
   try {
     settings = await api.adminSettings();
   } catch (e) {
-    body.replaceChildren(errorView(e, () => adminSettings()));
-    return { el, title: 'Settings' };
+    body.replaceChildren(errorView(e, () => load(body)));
+    return;
   }
 
   body.replaceChildren(
@@ -51,7 +57,6 @@ export default async function adminSettings() {
     metricsCard(settings),
     footer(settings),
   );
-  return { el, title: 'Settings' };
 }
 
 function backLink() {
@@ -288,11 +293,11 @@ function wireSave(form, save, status, read) {
     try {
       await api.putAdminSettings(read());
       status.style.color = 'var(--ok)';
-      status.replaceChildren(icon('check'), document.createTextNode('Saved and applied.'));
+      status.replaceChildren(icon('check', { size: '1.25rem' }), document.createTextNode('Saved and applied.'));
       announce('Settings saved');
     } catch (err) {
       status.style.color = 'var(--danger)';
-      status.replaceChildren(icon('warn'), document.createTextNode(errorMessage(err)));
+      status.replaceChildren(icon('warn', { size: '1.25rem' }), document.createTextNode(errorMessage(err)));
       announce(errorMessage(err));
     } finally {
       save.disabled = false;

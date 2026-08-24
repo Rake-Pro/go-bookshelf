@@ -116,7 +116,7 @@ a { color: var(--accent); }
  * @returns {HTMLButtonElement|null}
  */
 export function addBooksButton(opts) {
-  if (!store.canUpload) return null;
+  if (!store.canUpload || !(opts.libraries || []).length) return null;
   const b = document.createElement('button');
   b.type = 'button';
   b.className = 'btn btn--primary';
@@ -136,6 +136,7 @@ export function addBooksButton(opts) {
  */
 export function openAddBooks(host, opts) {
   const libraries = (opts.libraries || []).filter(Boolean);
+  if (!libraries.length) return null;
   const box = document.createElement('div');
 
   const style = document.createElement('style');
@@ -547,6 +548,7 @@ function buildImport(panel, libraries, opts, cleanups) {
   panel.append(lib.el, field, actions, problem, status, list);
 
   let announced = new Map();
+  let seeded = false;
   let timer = 0;
 
   async function refresh() {
@@ -554,14 +556,21 @@ function buildImport(panel, libraries, opts, cleanups) {
       const data = await api.imports();
       const jobs = data?.items || [];
       list.replaceChildren(...jobs.map(jobRow));
-      // Only say something when a job actually changed state, or the live
-      // region would repeat itself every two seconds.
-      for (const job of jobs) {
-        if (announced.get(job.id) !== job.status && (job.status === 'done' || job.status === 'failed')) {
-          announce(job.status === 'done' ? `Import finished: ${job.message || job.url}` : `Import failed: ${job.message}`);
-          if (job.status === 'done') opts.onAdded?.();
+      if (!seeded) {
+        // Seed from the first fetch without announcing or firing onAdded:
+        // these are jobs that finished before the sheet was even opened.
+        for (const job of jobs) announced.set(job.id, job.status);
+        seeded = true;
+      } else {
+        // Only say something when a job actually changed state, or the live
+        // region would repeat itself every two seconds.
+        for (const job of jobs) {
+          if (announced.get(job.id) !== job.status && (job.status === 'done' || job.status === 'failed')) {
+            announce(job.status === 'done' ? `Import finished: ${job.message || job.url}` : `Import failed: ${job.message}`);
+            if (job.status === 'done') opts.onAdded?.();
+          }
+          announced.set(job.id, job.status);
         }
-        announced.set(job.id, job.status);
       }
       const running = jobs.some((j) => j.status === 'queued' || j.status === 'running');
       status.textContent = running ? 'Working...' : '';

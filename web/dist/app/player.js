@@ -58,6 +58,8 @@ class PlayerController extends EventTarget {
   #lastSaved = -1;
   #lastChapter = -1;
   #seekPending = 0;
+  /** True when `duration` was summed from files[].duration_ms rather than taken from item.duration_ms. */
+  #durationIsSum = false;
 
   constructor() {
     super();
@@ -82,6 +84,12 @@ class PlayerController extends EventTarget {
       const t = this.tracks[this.index];
       if (t && Number.isFinite(this.audio.duration) && this.audio.duration > 0) {
         t.duration = Math.round(this.audio.duration * 1000);
+        // Offsets and chapter bounds stay on the catalog scale: shifting the
+        // later tracks here would desync chapters[], which is baked from the
+        // original offsets at load(). Only the summed total is refreshed.
+        if (this.#durationIsSum) {
+          this.duration = this.tracks.reduce((sum, x) => sum + x.duration, 0);
+        }
       }
       if (this.#seekPending) {
         const target = this.#seekPending;
@@ -123,6 +131,7 @@ class PlayerController extends EventTarget {
       return t;
     });
     this.duration = item.duration_ms || offset;
+    this.#durationIsSum = !item.duration_ms;
     this.chapters = this.#buildChapters(item, files);
     this.index = 0;
     this.#lastChapter = -1;

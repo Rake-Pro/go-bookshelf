@@ -4,6 +4,7 @@ import { api } from '../api.js';
 import { page } from '../components/page.js';
 import { itemGrid } from '../components/item-card.js';
 import { emptyView, errorView, loadingView } from '../components/states.js';
+import { router } from '../router.js';
 
 /** @param {import('../router.js').RouteCtx} ctx */
 export default async function authors(ctx) {
@@ -38,7 +39,7 @@ async function index() {
     }
     body.replaceChildren(ul);
   } catch (e) {
-    body.replaceChildren(errorView(e, () => index()));
+    body.replaceChildren(errorView(e, () => router.refresh()));
   }
   return { el, title: 'Authors' };
 }
@@ -59,7 +60,7 @@ async function one(id) {
       : emptyView('No books', 'This author has no books you can see.'));
     return { el, title: name };
   } catch (e) {
-    body.replaceChildren(errorView(e, () => one(id)));
+    body.replaceChildren(errorView(e, () => router.refresh()));
     return { el, title: 'Author' };
   }
 }

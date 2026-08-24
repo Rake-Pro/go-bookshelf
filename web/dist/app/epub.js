@@ -245,6 +245,10 @@ html {
   hyphens: auto;
   -webkit-hyphens: auto;
   text-rendering: optimizeLegibility;
+  /* The reader's own size control is the only thing that may change the text
+     size; mobile autosizing would fight it column by column. Matches app.css. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 body {
   color: ${p.fg};

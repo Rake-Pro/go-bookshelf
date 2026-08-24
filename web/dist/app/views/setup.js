@@ -504,15 +504,15 @@ export function oidcTestButton(read) {
       const res = await api.testOidc(read());
       if (res?.ok) {
         out.style.color = 'var(--ok)';
-        out.replaceChildren(icon('check'), document.createTextNode(
+        out.replaceChildren(icon('check', { size: '1.25rem' }), document.createTextNode(
           `Discovery succeeded. Group membership is read from the "${res.groups_claim}" claim.`));
       } else {
         out.style.color = 'var(--danger)';
-        out.replaceChildren(icon('warn'), document.createTextNode(res?.error || 'The provider could not be reached.'));
+        out.replaceChildren(icon('warn', { size: '1.25rem' }), document.createTextNode(res?.error || 'The provider could not be reached.'));
       }
     } catch (e) {
       out.style.color = 'var(--danger)';
-      out.replaceChildren(icon('warn'), document.createTextNode(errorMessage(e)));
+      out.replaceChildren(icon('warn', { size: '1.25rem' }), document.createTextNode(errorMessage(e)));
     } finally {
       btn.disabled = false;
     }

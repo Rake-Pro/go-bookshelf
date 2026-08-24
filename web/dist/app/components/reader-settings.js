@@ -34,6 +34,18 @@ export const READER_THEMES = [
   ['custom', 'Custom'],
 ];
 
+/**
+ * Two columns need at least this much width, and a landscape viewport. Lives
+ * here rather than in the reader view so the control and the layout that
+ * honours it read the same number.
+ */
+export const TWO_COLUMN_MIN_PX = 1100;
+
+/** Whether the viewport can carry two columns of a readable measure. */
+export function twoColumnsPossible() {
+  return window.innerWidth >= TWO_COLUMN_MIN_PX && window.innerWidth > window.innerHeight;
+}
+
 const SCALE_MIN = 0.7;
 const SCALE_MAX = 2.5;
 const SCALE_STEP = 0.05;
@@ -63,6 +75,11 @@ export function readerSettingsControls(onChange, opts = {}) {
 
   const text = group('Text');
 
+  // Label on its own line, controls below, the same shape as rangeRow: a
+  // 360px-wide phone cannot fit a label, two 44px steppers, a slider and a
+  // readout on one line without leaving the slider unusable.
+  const sizeField = document.createElement('div');
+  sizeField.className = 'rs-field';
   const sizeRow = document.createElement('div');
   sizeRow.className = 'rs-row';
   const scaleLabel = document.createElement('span');
@@ -106,8 +123,9 @@ export function readerSettingsControls(onChange, opts = {}) {
     syncScale();
   });
 
-  sizeRow.append(scaleLabel, minus, scale, plus, scaleOut);
-  text.append(sizeRow);
+  sizeRow.append(minus, scale, plus, scaleOut);
+  sizeField.append(scaleLabel, sizeRow);
+  text.append(sizeField);
   syncScale();
 
   text.append(segmented('Font', 'reader-font', FONT_FAMILIES, () => r().font_family,
@@ -180,9 +198,46 @@ export function readerSettingsControls(onChange, opts = {}) {
     [['paginated', 'Pages'], ['scrolled', 'Scrolling']],
     () => r().layout, (v) => set({ layout: /** @type {any} */ (v) }), syncers));
 
-  layout.append(segmented('Columns', 'reader-columns',
+  // Two columns on a phone would give each one a ~180px measure, so the
+  // renderer ignores the choice there. Show that in the control rather than
+  // accepting a setting that will not be honoured.
+  const TWO_COL_HINT = 'Two columns need a wider screen in landscape';
+  const columnsField = segmented('Columns', 'reader-columns',
     [['auto', 'Automatic'], ['1', 'One'], ['2', 'Two']],
-    () => r().columns, (v) => set({ columns: /** @type {any} */ (v) }), syncers));
+    () => r().columns, (v) => set({ columns: /** @type {any} */ (v) }), syncers,
+    twoColumnsPossible() ? {} : {
+      disabled: ['2'],
+      disabledHint: TWO_COL_HINT,
+    });
+  layout.append(columnsField);
+
+  // twoColumnsPossible() was only read once, at build time; rotating the
+  // device while the sheet is open must not leave the option stuck in
+  // whichever state it started in.
+  const twoColLabel = /** @type {HTMLLabelElement|null} */ (columnsField.querySelector('label[data-value="2"]'));
+  const twoColInput = /** @type {HTMLInputElement|null} */ (twoColLabel?.querySelector('input'));
+  const syncTwoColumnsDisabled = () => {
+    if (!twoColLabel || !twoColInput) return;
+    const disabled = !twoColumnsPossible();
+    twoColInput.disabled = disabled;
+    twoColLabel.classList.toggle('is-off', disabled);
+    if (disabled) {
+      twoColLabel.title = TWO_COL_HINT;
+      twoColInput.setAttribute('aria-label', `Two. ${TWO_COL_HINT}`);
+    } else {
+      twoColLabel.removeAttribute('title');
+      twoColInput.removeAttribute('aria-label');
+    }
+  };
+  // Self-removes once the control leaves the document (the sheet closes and
+  // discards its content), the same teardown shape as preview()'s listener.
+  const onResize = () => {
+    if (!root.isConnected) { window.removeEventListener('resize', onResize); return; }
+    syncTwoColumnsDisabled();
+  };
+  // opts.signal ties the listener to the caller's lifetime (a closing sheet,
+  // a leaving view); the isConnected check above is the fallback.
+  window.addEventListener('resize', onResize, opts.signal ? { signal: opts.signal } : undefined);
 
   root.append(layout);
 
@@ -301,7 +356,7 @@ function stepButton(iconName, label, onClick) {
  * @param {() => string} value
  * @param {(v:string) => void} onChange
  * @param {(() => void)[]} syncers
- * @param {{wrap?:boolean}} [opts]
+ * @param {{wrap?:boolean, disabled?:string[], disabledHint?:string}} [opts]
  */
 function segmented(legend, name, options, value, onChange, syncers, opts = {}) {
   const fs = document.createElement('fieldset');
@@ -338,6 +393,14 @@ function segmented(legend, name, options, value, onChange, syncers, opts = {}) {
     });
     const span = document.createElement('span');
     span.textContent = label;
+    if (opts.disabled?.includes(v)) {
+      input.disabled = true;
+      l.classList.add('is-off');
+      if (opts.disabledHint) {
+        l.title = opts.disabledHint;
+        input.setAttribute('aria-label', `${label}. ${opts.disabledHint}`);
+      }
+    }
     l.append(input, span);
     labels.push(l);
     strip.append(l);
@@ -641,7 +704,11 @@ function controlsStyle() {
   color: var(--accent-text);
   background: var(--accent);
 }
-.rs-seg label:hover:not(.is-on) { background: var(--surface); }
+.rs-seg label:hover:not(.is-on):not(.is-off) { background: var(--surface); }
+/* An option the viewport cannot honour is shown greyed out, not silently
+   ignored. */
+.rs-seg label.is-off { opacity: 0.45; cursor: not-allowed; }
+.rs-seg label.is-off input { cursor: not-allowed; }
 .rs-seg label:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset: 2px; }
 
 .rs-swatches {

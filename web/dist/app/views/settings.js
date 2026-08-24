@@ -13,15 +13,17 @@ import { player } from '../player.js';
 
 export default async function settings() {
   const { el, body } = page('Settings');
+  // Tears down the reading controls' window listener when the route exits.
+  const ac = new AbortController();
 
   body.append(
     profileSection(),
     appearanceSection(),
-    readingSection(),
+    readingSection(ac.signal),
     playbackSection(),
   );
 
-  return { el, title: 'Settings' };
+  return { el, title: 'Settings', destroy: () => ac.abort() };
 }
 
 /** @param {string} title */
@@ -97,13 +99,13 @@ function appearanceSection() {
   return s;
 }
 
-function readingSection() {
+function readingSection(signal) {
   const s = group('Reading defaults');
   const p = document.createElement('p');
   p.className = 'muted small';
   p.textContent = 'These apply to every book. You can change them while reading too.';
   s.append(p);
-  s.append(readerSettingsControls(() => {}));
+  s.append(readerSettingsControls(() => {}, { signal }));
   return s;
 }
 
