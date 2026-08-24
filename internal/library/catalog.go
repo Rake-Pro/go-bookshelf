@@ -493,6 +493,22 @@ func (c *Catalog) ItemFilePaths(ctx context.Context, itemID int64) ([]string, er
 	return paths, rows.Err()
 }
 
+// DeleteItem removes the catalog record for one item. Its files, chapters,
+// contributor and series/tag links, cover images, progress and bookmarks all
+// cascade with it - every one of those tables' foreign keys is ON DELETE
+// CASCADE (docs/DESIGN.md). This only ever touches the database; removing the
+// underlying files from disk, inside the library root, is the caller's job.
+func (c *Catalog) DeleteItem(ctx context.Context, id int64) error {
+	res, err := c.db.ExecContext(ctx, `DELETE FROM items WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
 func escapeLike(s string) string {
 	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 	return r.Replace(s)

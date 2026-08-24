@@ -173,6 +173,13 @@ func TestOIDCRoleIsReevaluated(t *testing.T) {
 		t.Errorf("after joining the admin group, role = %q, want admin", promoted.Role)
 	}
 
+	// A second administrator, so the demotion below is not also the last
+	// enabled administrator - that case is refused regardless of the
+	// directory, and is its own test: TestOIDCDoesNotDemoteTheLastEnabledAdmin.
+	if _, err := h.signIn(t, "steady", []string{"bookshelf-admins"}); err != nil {
+		t.Fatalf("sign in second admin: %v", err)
+	}
+
 	demoted, err := h.signIn(t, "moving", []string{"bookshelf-users"})
 	if err != nil {
 		t.Fatalf("sign in: %v", err)
@@ -276,5 +283,96 @@ func TestPrepareReportsDiscoveryFailure(t *testing.T) {
 	}
 	if !mgr.LocalLoginEnabled() {
 		t.Error("local sign-in must survive a failed discovery")
+	}
+}
+
+// The last enabled administrator keeps the role on sign-in even without a
+// local password - the break-glass exception in shouldApplyRole only covers
+// the password admin, so a pure-SSO sole administrator needs this one.
+// Demoting them here would leave the server with no way to administer it the
+// moment the directory is what changed.
+func TestOIDCDoesNotDemoteTheLastEnabledAdmin(t *testing.T) {
+	h := newOIDCHarness(t, "bookshelf-admins", "bookshelf-users")
+
+	promoted, err := h.signIn(t, "solo", []string{"bookshelf-admins"})
+	if err != nil {
+		t.Fatalf("sign in: %v", err)
+	}
+	if promoted.Role != auth.RoleAdmin {
+		t.Fatalf("first sign-in role = %q, want admin", promoted.Role)
+	}
+	if n, err := h.mgr.AdminCount(h.ctx); err != nil || n != 1 {
+		t.Fatalf("admin count after first sign-in = %d, %v, want 1", n, err)
+	}
+
+	// The directory revokes their admin membership. The sign-in still must
+	// succeed, but the role must not move.
+	demoted, err := h.signIn(t, "solo", []string{"bookshelf-users"})
+	if err != nil {
+		t.Fatalf("sign in after losing admin group membership: %v", err)
+	}
+	if demoted.Role != auth.RoleAdmin {
+		t.Errorf("role after losing group membership = %q, want the last admin to keep it", demoted.Role)
+	}
+	if n, err := h.mgr.AdminCount(h.ctx); err != nil || n != 1 {
+		t.Errorf("admin count after the refused demotion = %d, %v, want still 1", n, err)
+	}
+
+	// With a second administrator present, demoting this one no longer risks
+	// zero, so the directory is honored again.
+	if _, err := h.signIn(t, "backup", []string{"bookshelf-admins"}); err != nil {
+		t.Fatalf("sign in second admin: %v", err)
+	}
+	demotedAgain, err := h.signIn(t, "solo", []string{"bookshelf-users"})
+	if err != nil {
+		t.Fatalf("sign in: %v", err)
+	}
+	if demotedAgain.Role != auth.RoleUser {
+		t.Errorf("role with a second admin present = %q, want user", demotedAgain.Role)
+	}
+}
+
+// An account not yet linked to an OIDC subject is exactly what a first
+// sign-in matches by username (userForSubject's adoption step), so renaming
+// it while single sign-on is configured is refused rather than silently
+// breaking that match. Once it has signed in once, the username is no
+// longer load-bearing and the rename is unrestricted - the next sign-in
+// still finds it by subject regardless of what the identity provider claims
+// as the username.
+func TestSetUsernameBlockedForUnboundAccountWhileOIDCConfigured(t *testing.T) {
+	h := newOIDCHarness(t, "bookshelf-admins", "")
+
+	placeholder, err := h.mgr.CreateUser(h.ctx, "future-user", "", "Future User", auth.RoleUser)
+	if err != nil {
+		t.Fatalf("pre-create account: %v", err)
+	}
+	if err := h.mgr.SetUsername(h.ctx, placeholder.ID, "renamed"); !errors.Is(err, auth.ErrUsernameNotRenameable) {
+		t.Fatalf("rename of an unbound account = %v, want ErrUsernameNotRenameable", err)
+	}
+
+	adopted, err := h.signIn(t, "future-user", nil)
+	if err != nil {
+		t.Fatalf("first sign-in: %v", err)
+	}
+	if adopted.ID != placeholder.ID {
+		t.Fatalf("first sign-in did not adopt the pre-created account (got %d, want %d)", adopted.ID, placeholder.ID)
+	}
+
+	if err := h.mgr.SetUsername(h.ctx, placeholder.ID, "renamed"); err != nil {
+		t.Fatalf("rename of a bound account: %v", err)
+	}
+
+	// The identity provider still calls this person "future-user"; the next
+	// sign-in finds the account by subject and does not care that the stored
+	// username has since changed.
+	signedIn, err := h.signIn(t, "future-user", nil)
+	if err != nil {
+		t.Fatalf("sign in after rename: %v", err)
+	}
+	if signedIn.ID != placeholder.ID {
+		t.Errorf("sign-in after rename adopted a different account (%d, want %d)", signedIn.ID, placeholder.ID)
+	}
+	if signedIn.Username != "renamed" {
+		t.Errorf("username after rename = %q, want it to have stuck", signedIn.Username)
 	}
 }

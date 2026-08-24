@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rake-pro/go-bookshelf/internal/auth"
 	"github.com/rake-pro/go-bookshelf/internal/oidctest"
 	"github.com/rake-pro/go-bookshelf/internal/settings"
 )
@@ -428,6 +429,54 @@ func TestLocalLoginGuard(t *testing.T) {
 	decode(t, h.do(http.MethodGet, "/api/v1/auth/status", nil), &status)
 	if status["local_login"] != false {
 		t.Errorf("auth status local_login = %v, want false", status["local_login"])
+	}
+
+	// The point of turning it off: single sign-on still works, driven
+	// through the real start/callback routes rather than the manager
+	// directly, so this proves the HTTP path and not just Login().
+	start := h.do(http.MethodGet, "/api/v1/auth/oidc/start", nil)
+	if start.Code != http.StatusFound {
+		t.Fatalf("oidc start = %d, want 302", start.Code)
+	}
+	var stateCookie *http.Cookie
+	for _, c := range start.Result().Cookies() {
+		if c.Name == "gbs_oidc" {
+			stateCookie = c
+		}
+	}
+	if stateCookie == nil {
+		t.Fatalf("oidc start set no state cookie: %v", start.Result().Cookies())
+	}
+	state, nonce, _ := strings.Cut(stateCookie.Value, ":")
+	idp.Issue(oidctest.Identity{
+		Subject: "subject-sso-admin", Username: "sso-admin", DisplayName: "SSO Admin",
+		Groups: []string{"bookshelf-admins"}, Nonce: nonce,
+	})
+	callback := h.do(http.MethodGet, "/api/v1/auth/oidc/callback?state="+state+"&code=authorization-code", nil,
+		func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "gbs_oidc", Value: stateCookie.Value}) })
+	if callback.Code != http.StatusFound {
+		t.Fatalf("oidc callback = %d, want 302: %s", callback.Code, callback.Body.String())
+	}
+	var ssoSID string
+	for _, c := range callback.Result().Cookies() {
+		if c.Name == auth.SessionCookie {
+			ssoSID = c.Value
+		}
+	}
+	if ssoSID == "" {
+		t.Fatalf("oidc callback did not set a session cookie: %v", callback.Result().Cookies())
+	}
+	me := h.do(http.MethodGet, "/api/v1/auth/me", nil, withCookie(ssoSID))
+	if me.Code != http.StatusOK {
+		t.Fatalf("auth/me after SSO sign-in = %d: %s", me.Code, me.Body.String())
+	}
+	var meBody struct {
+		Username string `json:"username"`
+		Role     string `json:"role"`
+	}
+	decode(t, me, &meBody)
+	if meBody.Username != "sso-admin" || meBody.Role != "admin" {
+		t.Errorf("SSO sign-in = %+v, want username sso-admin, role admin", meBody)
 	}
 }
 

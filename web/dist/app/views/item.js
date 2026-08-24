@@ -6,11 +6,14 @@
  */
 
 import { api, coverUrl, downloadUrl } from '../api.js';
-import { loadingView, errorView, emptyView } from '../components/states.js';
+import { loadingView, errorView, emptyView, errorMessage } from '../components/states.js';
 import { icon } from '../components/icons.js';
+import { confirmDialog } from '../components/confirm.js';
 import { duration, clock, peopleOf, seriesOf, percent, date, bytes } from '../format.js';
 import { player } from '../player.js';
 import { navigate } from '../router.js';
+import { store } from '../store.js';
+import { announce } from '../live.js';
 
 /** @param {import('../router.js').RouteCtx} ctx */
 export default async function itemView(ctx) {
@@ -105,7 +108,44 @@ export default async function itemView(ctx) {
   dl2.setAttribute('download', '');
   dl2.textContent = 'Download';
   actions.append(dl2);
-  info.append(actions);
+
+  // Deletion is an administrator power, like adding or scanning a library, so
+  // a plain user never sees a control it cannot use.
+  const deleteError = document.createElement('div');
+  deleteError.className = 'formerror';
+  deleteError.setAttribute('role', 'alert');
+  deleteError.hidden = true;
+  if (store.isAdmin) {
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn btn--danger';
+    del.append(icon('close'));
+    const delLabel = document.createElement('span');
+    delLabel.textContent = 'Delete';
+    del.append(delLabel);
+    del.addEventListener('click', async () => {
+      const ok = await confirmDialog(el, {
+        heading: 'Delete book',
+        message: `Delete "${item.title}"? This removes its file(s) from disk. This cannot be undone.`,
+        confirmLabel: 'Delete',
+        danger: true,
+      });
+      if (!ok) return;
+      del.disabled = true;
+      deleteError.hidden = true;
+      try {
+        await api.deleteItem(item.id);
+        announce(`Deleted ${item.title}`);
+        navigate('/library', { replace: true });
+      } catch (e) {
+        del.disabled = false;
+        deleteError.replaceChildren(icon('warn'), document.createTextNode(errorMessage(e)));
+        deleteError.hidden = false;
+      }
+    });
+    actions.append(del);
+  }
+  info.append(actions, deleteError);
 
   if (frac > 0 || finished) {
     const prog = document.createElement('p');

@@ -85,6 +85,7 @@ func (a *API) patchUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
+		Username    *string `json:"username"`
 		DisplayName *string `json:"display_name"`
 		Role        *string `json:"role"`
 		Password    *string `json:"password"`
@@ -94,14 +95,45 @@ func (a *API) patchUser(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if _, err := a.auth.UserByID(r.Context(), userID); err != nil {
+	target, err := a.auth.UserByID(r.Context(), userID)
+	if err != nil {
 		fail(w, err, "patch user")
 		return
+	}
+	// Whether target is, right now, the last enabled administrator - computed
+	// once against the state before this request, so a role change and a
+	// disable in the same request are each judged against the same snapshot
+	// rather than one hiding from the other's check after the first applies.
+	isLastAdmin := false
+	if target.Role == auth.RoleAdmin && !target.Disabled {
+		n, err := a.auth.AdminCount(r.Context())
+		if err != nil {
+			fail(w, err, "patch user")
+			return
+		}
+		isLastAdmin = n <= 1
+	}
+	if body.Username != nil {
+		switch err := a.auth.SetUsername(r.Context(), userID, *body.Username); {
+		case errors.Is(err, auth.ErrUsernameTaken):
+			writeError(w, http.StatusConflict, codeConflict, err.Error())
+			return
+		case errors.Is(err, auth.ErrUsernameNotRenameable):
+			writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
+			return
+		case err != nil:
+			writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
+			return
+		}
 	}
 	if body.Role != nil {
 		// An administrator must not be able to lock every admin out.
 		if *body.Role != auth.RoleAdmin && userID == admin.User.ID {
 			writeError(w, http.StatusBadRequest, codeBadRequest, "an administrator cannot demote their own account")
+			return
+		}
+		if *body.Role != auth.RoleAdmin && isLastAdmin {
+			writeError(w, http.StatusBadRequest, codeBadRequest, "cannot demote the last administrator")
 			return
 		}
 		if err := a.auth.SetRole(r.Context(), userID, *body.Role); err != nil {
@@ -112,6 +144,10 @@ func (a *API) patchUser(w http.ResponseWriter, r *http.Request) {
 	if body.Disabled != nil {
 		if *body.Disabled && userID == admin.User.ID {
 			writeError(w, http.StatusBadRequest, codeBadRequest, "an administrator cannot disable their own account")
+			return
+		}
+		if *body.Disabled && isLastAdmin {
+			writeError(w, http.StatusBadRequest, codeBadRequest, "cannot disable the last administrator")
 			return
 		}
 		if err := a.auth.SetDisabled(r.Context(), userID, *body.Disabled); err != nil {
@@ -160,6 +196,29 @@ func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, codeBadRequest, "an administrator cannot delete their own account")
 		return
 	}
+	target, err := a.auth.UserByID(r.Context(), userID)
+	if err != nil {
+		fail(w, err, "delete user")
+		return
+	}
+	// Mirrors the break-glass reasoning in patchUser's own-role guard, one
+	// level up: a self-demotion leaves this account able to sign in and fix
+	// things; deleting the last administrator leaves nobody able to.
+	if target.Role == auth.RoleAdmin && !target.Disabled {
+		n, err := a.auth.AdminCount(r.Context())
+		if err != nil {
+			fail(w, err, "delete user")
+			return
+		}
+		if n <= 1 {
+			writeError(w, http.StatusBadRequest, codeBadRequest, "cannot delete the last administrator")
+			return
+		}
+	}
+	// Everything this account owns - sessions, api tokens, library grants,
+	// settings, progress, bookmarks, collections, import jobs - cascades with
+	// the row (every user_id foreign key is ON DELETE CASCADE; see
+	// docs/DESIGN.md). Deleting it here is the whole cleanup.
 	if err := a.auth.DeleteUser(r.Context(), userID); err != nil {
 		fail(w, err, "delete user")
 		return

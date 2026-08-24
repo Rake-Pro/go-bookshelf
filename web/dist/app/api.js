@@ -204,6 +204,8 @@ export const api = {
   item: (id) => request(`/items/${encodeURIComponent(id)}`),
   /** @param {string} id @param {any} patch */
   patchItem: (id, patch) => send(`/items/${encodeURIComponent(id)}`, patch, 'PATCH'),
+  /** @param {string} id */
+  deleteItem: (id) => request(`/items/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   authors: (params = {}) => request('/authors' + qs(params)),
   author: (id) => request(`/authors/${encodeURIComponent(id)}`),

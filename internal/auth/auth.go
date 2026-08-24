@@ -60,6 +60,13 @@ var (
 	ErrRateLimited     = errors.New("auth: too many attempts")
 	ErrLocalLoginOff   = errors.New("auth: password sign-in is disabled")
 	ErrWeakPassword    = fmt.Errorf("auth: password must be at least %d characters", MinPasswordLength)
+	// ErrUsernameTaken is a case-insensitive collision: the same fold every
+	// lookup against username already applies.
+	ErrUsernameTaken = errors.New("auth: that username is already taken")
+	// ErrUsernameNotRenameable is returned for an account OIDC's first-login
+	// adoption could still match by username - see SetUsername.
+	ErrUsernameNotRenameable = errors.New(
+		"auth: this account has not signed in yet and cannot be renamed while single sign-on is configured")
 )
 
 // User is an account record.
@@ -73,6 +80,12 @@ type User struct {
 	HasPassword bool   `json:"has_password"`
 	CanUpload   bool   `json:"can_upload"`
 	OIDCSubject string `json:"-"`
+	// OIDCLinked reports whether OIDCSubject is set, without exposing the
+	// subject value itself. It is what the admin page uses to tell a bound
+	// account (rename is purely cosmetic) from one still adoptable by
+	// username match on its first SSO sign-in (rename would break that
+	// match) - see SetUsername.
+	OIDCLinked bool `json:"oidc_linked"`
 }
 
 // IsAdmin reports whether the user holds the admin role.
@@ -260,6 +273,7 @@ func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	u.Disabled = disabledAt.Valid
 	u.HasPassword = passwd.Valid && passwd.String != ""
 	u.OIDCSubject = subject.String
+	u.OIDCLinked = subject.Valid && subject.String != ""
 	return &u, nil
 }
 
@@ -374,6 +388,45 @@ func (m *Manager) SetDisabled(ctx context.Context, userID int64, disabled bool) 
 	return nil
 }
 
+// SetUsername renames a local account.
+//
+// An account already linked to an OIDC subject can be renamed freely: every
+// lookup after its first sign-in goes by that subject, never by username
+// again, so the rename is purely cosmetic. An account that has not linked
+// yet is a different story while single sign-on is configured: its current
+// username is exactly what a first sign-in matches a pre-created account by
+// (see oidc.go, userForSubject's adoption step), so renaming it here would
+// only make that match silently fail on whoever was waiting for it - either
+// spawning a duplicate account (auto-register on) or locking them out
+// (auto-register off). Refusing the rename until either single sign-on is
+// off or the account has linked once is what keeps that promise rather than
+// quietly orphaning it. The collision check folds case the same way every
+// other username lookup in this package does, so a rename cannot create the
+// kind of same-username-different-case pair that would make a future
+// case-insensitive lookup ambiguous.
+func (m *Manager) SetUsername(ctx context.Context, userID int64, username string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("auth: username is required")
+	}
+	u, err := m.UserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if m.OIDCEnabled() && !u.OIDCLinked {
+		return ErrUsernameNotRenameable
+	}
+	existing, err := m.UserByUsername(ctx, username)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if err == nil && existing.ID != userID {
+		return ErrUsernameTaken
+	}
+	_, err = m.db.ExecContext(ctx, `UPDATE users SET username = ? WHERE id = ?`, username, userID)
+	return err
+}
+
 // SetRole changes a user's role.
 func (m *Manager) SetRole(ctx context.Context, userID int64, role string) error {
 	switch role {
@@ -402,6 +455,16 @@ func (m *Manager) SetCanUpload(ctx context.Context, userID int64, allowed bool) 
 func (m *Manager) DeleteUser(ctx context.Context, userID int64) error {
 	_, err := m.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, userID)
 	return err
+}
+
+// AdminCount counts enabled administrators. It is what tells the delete-user
+// handler whether removing this account would leave the server with no way
+// for anyone to sign in as an administrator.
+func (m *Manager) AdminCount(ctx context.Context) (int, error) {
+	var n int
+	err := m.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM users WHERE role = ? AND disabled_at IS NULL`, RoleAdmin).Scan(&n)
+	return n, err
 }
 
 // AdminsWithOIDC counts enabled administrators already linked to an identity

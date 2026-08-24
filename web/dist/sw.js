@@ -11,9 +11,15 @@
 * VERSION is rewritten to the build version by the server when it serves this
  * file, so every release drops the old caches on activate. The literal below is
  * only what a dev build uses.
+ *
+ * Update handoff: a new worker installs and precaches, then waits - it never
+ * calls skipWaiting() on its own. main.js shows a toast once a waiting worker
+ * exists and posts {type:'SKIP_WAITING'} if the person clicks Refresh; only
+ * then does this worker take over (clients.claim() on activate) and the page
+ * reloads.
  */
 
-const VERSION = 'v3';
+const VERSION = 'v6';
 const SHELL_CACHE = `bookshelf-shell-${VERSION}`;
 const COVER_CACHE = `bookshelf-covers-${VERSION}`;
 const MAX_COVERS = 400;
@@ -37,6 +43,7 @@ const SHELL = [
   '/app/components/item-card.js',
   '/app/components/mini-player.js',
   '/app/components/sheet.js',
+  '/app/components/update-toast.js',
   '/app/views/home.js',
   '/manifest.webmanifest',
   '/icons/icon.svg',
@@ -50,7 +57,10 @@ self.addEventListener('install', (event) => {
     // Individually, so one missing file cannot fail the whole install.
     await Promise.all(SHELL.map((url) =>
       cache.add(new Request(url, { cache: 'reload' })).catch(() => {})));
-    await self.skipWaiting();
+    // Deliberately no skipWaiting() here: a new worker sits in "waiting"
+    // until the page asks for it (see the message handler below), so an
+    // update never swaps out from under a page mid-session - an audiobook
+    // playing in the mini-player must not be interrupted by a deploy.
   })());
 });
 
@@ -65,7 +75,9 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('message', (event) => {
-  if (event.data === 'skip-waiting') self.skipWaiting();
+  // The canonical update-toast handshake: the page asks the waiting worker
+  // to take over once the person has agreed to refresh.
+  if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
 self.addEventListener('fetch', (event) => {
