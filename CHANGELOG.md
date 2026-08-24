@@ -6,6 +6,12 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Elements with the `hidden` attribute could still render as empty boxes when
+  a class gave them a `display` value (the login page's hidden error box
+  showed as an empty strip above the SSO button). A global
+  `[hidden] { display: none !important }` now makes `hidden` authoritative.
+
 ### Added
 - **Per-user library access management in the admin UI.** The Users panel now
   shows each non-admin user's library grants as a checkbox list (backed by the
