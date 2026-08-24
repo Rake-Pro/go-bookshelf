@@ -18,7 +18,10 @@ import { errorMessage } from '../components/states.js';
 
 /** @param {import('../router.js').RouteCtx} ctx */
 export default async function login(ctx) {
-  const next = ctx.query.get('next') || '/';
+  const rawNext = ctx.query.get('next') || '/';
+  // Reject //evil.example, which navigate() would treat as protocol-relative
+  // and follow off-origin, even though it passes a bare startsWith('/') check.
+  const next = rawNext.startsWith('/') && !rawNext.startsWith('//') ? rawNext : '/';
 
   const wrap = document.createElement('div');
   wrap.className = 'auth-wrap';
@@ -71,7 +74,7 @@ export default async function login(ctx) {
       const user = await auth.login(username, password);
       store.setUser(user);
       await store.load().catch(() => {});
-      navigate(next.startsWith('/') ? next : '/', { replace: true });
+      navigate(next, { replace: true });
     } catch (err) {
       showError(err instanceof ApiError && err.status === 401
         ? 'Wrong username or password.'
@@ -92,7 +95,7 @@ export default async function login(ctx) {
   let focusForm = true;
   try {
     const { oidc, setupRequired, localLogin, user } = await probeAuth();
-    if (user) { navigate(next.startsWith('/') ? next : '/', { replace: true }); }
+    if (user) { navigate(next, { replace: true }); }
     if (setupRequired) {
       const notice = document.createElement('p');
       notice.className = 'muted';

@@ -19,10 +19,14 @@ export function loadingView(label = 'Loading') {
   return d;
 }
 
-/** A grid of placeholder cards while items load. @param {number} n */
-export function skeletonGrid(n = 12) {
+/**
+ * A grid (or rail, mirroring itemGrid's classes) of placeholder cards while
+ * items load.
+ * @param {number} n @param {{rail?:boolean}} [opts]
+ */
+export function skeletonGrid(n = 12, opts = {}) {
   const ul = document.createElement('ul');
-  ul.className = 'grid-items';
+  ul.className = opts.rail ? 'rail' : 'grid-items';
   ul.setAttribute('aria-hidden', 'true');
   for (let i = 0; i < n; i++) {
     const li = document.createElement('li');

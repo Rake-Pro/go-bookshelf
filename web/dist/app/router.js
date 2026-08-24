@@ -12,6 +12,9 @@
  * @property {Record<string,string>} params
  * @property {URLSearchParams} query
  * @property {string} path
+ * @property {number|null} restore scroll offset to put back for this history
+ *   entry (a Back or Forward), or null for a fresh navigation, which starts at
+ *   the top. The renderer owns the actual scrolling.
  */
 
 /**
@@ -46,6 +49,13 @@ function compile(pattern) {
   return { keys, re: new RegExp('^' + (source || '/') + '/?$') };
 }
 
+/** How many history entries keep a remembered scroll offset. */
+const SCROLL_MEMORY = 50;
+
+let keySeq = 0;
+/** A key that is unique per entry and survives a reload of the same entry. */
+const newKey = () => `${Date.now().toString(36)}-${(keySeq++).toString(36)}`;
+
 export class Router extends EventTarget {
   /** @type {Route[]} */
   #routes = [];
@@ -57,6 +67,23 @@ export class Router extends EventTarget {
   #render = null;
   /** Bumped on every navigation so a slow view cannot overwrite a newer one. */
   #nav = 0;
+  /** path+search of the last resolve, so fragment-only entries are left alone. */
+  #lastLoc = '';
+  /**
+   * Scroll offset per history entry, oldest first. The browser cannot do this
+   * for us: `scrollRestoration` is turned off below because it fires against
+   * the outgoing document, before the new view has been built, and would land
+   * on whatever height the old page happened to have.
+   * @type {Map<string, number>}
+   */
+  #scroll = new Map();
+  /** Key of the entry currently on screen; `history.state.bsKey` mirrors it. */
+  #key = '';
+  /**
+   * Offset to restore on the resolve now in flight, or null to go to the top.
+   * @type {number|null}
+   */
+  #restore = null;
 
   /**
    * @param {string} pattern
@@ -85,9 +112,52 @@ export class Router extends EventTarget {
   /** @param {(route:Route|null, view:View|null, ctx:RouteCtx) => void} render */
   start(render) {
     this.#render = render;
-    window.addEventListener('popstate', () => this.#resolve());
+    if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+    this.#key = this.#adoptKey();
+    window.addEventListener('popstate', () => {
+      // A fragment-only entry (the skip link's #main) changes neither path
+      // nor search: rebuilding the view and forcing scroll-to-top would
+      // punish exactly the keyboard users that link serves. Stamp a key and
+      // leave the document alone.
+      if (location.pathname + location.search === this.#lastLoc) {
+        this.#key = this.#adoptKey();
+        return;
+      }
+      // popstate arrives with the new entry already current but the old
+      // document still on screen and still at its own scroll offset, so this
+      // is the last moment the departing entry's position can be read.
+      this.#saveScroll();
+      this.#key = this.#adoptKey();
+      this.#restore = this.#scroll.get(this.#key) ?? null;
+      this.#resolve();
+    });
     document.addEventListener('click', (e) => this.#onClick(e));
     this.#resolve();
+  }
+
+  /**
+   * The key of the current history entry, stamping one on if it has none (a
+   * cold load, or an entry pushed before the router started).
+   * @returns {string}
+   */
+  #adoptKey() {
+    const state = history.state;
+    if (state && typeof state.bsKey === 'string') return state.bsKey;
+    const key = newKey();
+    history.replaceState({ ...(state || {}), bsKey: key }, '');
+    return key;
+  }
+
+  /** Remember where the entry on screen is scrolled to, bounded to the last N. */
+  #saveScroll() {
+    if (!this.#key) return;
+    this.#scroll.delete(this.#key);
+    this.#scroll.set(this.#key, window.scrollY);
+    while (this.#scroll.size > SCROLL_MEMORY) {
+      const oldest = this.#scroll.keys().next().value;
+      if (oldest === undefined) break;
+      this.#scroll.delete(oldest);
+    }
   }
 
   /**
@@ -99,15 +169,29 @@ export class Router extends EventTarget {
     if (url.origin !== location.origin) { location.href = to; return; }
     const same = url.pathname + url.search === location.pathname + location.search;
     if (same) return;
-    if (opts.replace) history.replaceState(null, '', url);
-    else history.pushState(null, '', url);
+    this.#saveScroll();
+    const key = newKey();
+    if (opts.replace) {
+      // The entry being replaced is gone for good, and so is its position.
+      this.#scroll.delete(this.#key);
+      history.replaceState({ bsKey: key }, '', url);
+    } else {
+      history.pushState({ bsKey: key }, '', url);
+    }
+    this.#key = key;
+    // A fresh navigation starts at the top; only Back and Forward restore.
+    this.#restore = null;
     this.#resolve();
   }
 
   /** Intercept same-origin left clicks on plain links. */
   #onClick(e) {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-    const a = /** @type {Element} */ (e.target)?.closest?.('a[href]');
+    // Events from a shadow root retarget e.target to the host; composedPath()[0]
+    // is the element actually clicked, so links inside bs-item-card etc. are
+    // still caught instead of falling through to a full page load.
+    const origin = /** @type {Element} */ (e.composedPath?.()[0] ?? e.target);
+    const a = origin?.closest?.('a[href]');
     if (!a) return;
     const href = a.getAttribute('href') || '';
     if (a.hasAttribute('download') || a.getAttribute('target') === '_blank') return;
@@ -124,12 +208,20 @@ export class Router extends EventTarget {
   async #resolve() {
     const nav = ++this.#nav;
     const path = location.pathname;
+    this.#lastLoc = path + location.search;
     const hit = this.match(path);
+    // Consumed here, so a view that resolves late cannot restore a position
+    // belonging to a navigation that has since been superseded: a newer
+    // #resolve has taken the value and this one carries its own copy, which
+    // the generation check below discards along with the rest of the render.
+    const restore = this.#restore;
+    this.#restore = null;
     /** @type {RouteCtx} */
     const ctx = {
       params: hit?.params ?? {},
       query: new URLSearchParams(location.search),
       path,
+      restore,
     };
     this.dispatchEvent(new CustomEvent('navigate', { detail: ctx }));
 
@@ -150,7 +242,7 @@ export class Router extends EventTarget {
       const { errorView } = await import('./components/states.js');
       view = { el: errorView(e, () => this.#resolve()), title: 'Error' };
     }
-    if (nav !== this.#nav) return;
+    if (nav !== this.#nav) { try { view?.destroy?.(); } catch (e) { console.error(e); } return; }
     this.#swap(hit.route, view, ctx);
   }
 

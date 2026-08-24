@@ -111,7 +111,7 @@ export default async function library(ctx) {
       }
     }
   } catch (e) {
-    results.replaceChildren(errorView(e, () => library(ctx)));
+    results.replaceChildren(errorView(e, () => router.refresh()));
   }
 
   return { el, title: 'Library' };

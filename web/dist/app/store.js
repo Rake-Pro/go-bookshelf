@@ -7,7 +7,7 @@
  * debounced 500 ms and merged, so dragging a slider produces one PUT.
  */
 
-import { api } from './api.js';
+import { api, request } from './api.js';
 
 const LS_KEY = 'bookshelf.settings.v1';
 
@@ -155,16 +155,48 @@ class Store extends EventTarget {
     this.#timer = setTimeout(() => this.flush(), 500);
   }
 
-  /** Force any pending settings write out now (used on pagehide). */
-  async flush() {
+  /**
+   * Force any pending settings write out now (used on pagehide).
+   * @param {{keepalive?:boolean, retry?:boolean}} [opts] keepalive survives page
+   *   unload, where a normal fetch may be cancelled, matching player.js
+   *   saveProgress; retry marks the one automatic re-attempt after a failure
+   *   so it does not schedule another one of itself.
+   */
+  async flush(opts = {}) {
     clearTimeout(this.#timer);
+    this.#timer = undefined;
     if (!Object.keys(this.#pending).length) return;
     const body = this.#pending;
     this.#pending = {};
     try {
-      await api.putSettings(body);
+      if (opts.keepalive) {
+        await request('/me/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          keepalive: true,
+        });
+      } else {
+        await api.putSettings(body);
+      }
     } catch (e) {
+      // Merge the unsent patch back under anything newer, so it is not lost
+      // and a later flush retries it.
+      for (const group of /** @type {const} */ (['reader', 'player', 'ui'])) {
+        if (body[group]) this.#pending[group] = { ...body[group], ...(this.#pending[group] || {}) };
+      }
       this.#emit('settings-error', e);
+      // One automatic retry through the debounce timer, so a transient
+      // failure is not stuck waiting for the next edit or pagehide. If the
+      // retry itself fails, leave the patch pending as usual rather than
+      // retrying forever, and skip it entirely for a pagehide flush, which
+      // has no page left to retry from.
+      // ... but never clobber a sooner timer: an edit made while this PUT was
+      // in flight has already armed its own 500 ms debounce, which covers the
+      // merged-back patch too.
+      if (!opts.retry && !opts.keepalive && this.#timer === undefined) {
+        this.#timer = setTimeout(() => this.flush({ retry: true }), 5000);
+      }
     }
   }
 

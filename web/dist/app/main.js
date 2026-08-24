@@ -64,7 +64,17 @@ function render(route, view, ctx) {
     shell.main.replaceChildren(view.el);
     // Move focus to the top of the new view for screen reader and keyboard users.
     shell.main.focus({ preventScroll: true });
-    window.scrollTo({ top: 0 });
+    // Back and Forward come with the offset that entry was left at; anything
+    // else starts at the top. The view is in the document by now, so reading
+    // scrollHeight gives the height it will actually have - clamp to it, since
+    // the page being returned to can be shorter than it was (a filter changed,
+    // a book was removed).
+    if (ctx.restore != null) {
+      const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      window.scrollTo({ top: Math.min(ctx.restore, max) });
+    } else {
+      window.scrollTo({ top: 0 });
+    }
   } else {
     shellMounted = false;
     root.replaceChildren(view.el);
@@ -95,7 +105,7 @@ async function boot() {
 }
 
 /* Flush any debounced settings write before the page goes away. */
-window.addEventListener('pagehide', () => { store.flush(); });
+window.addEventListener('pagehide', () => { store.flush({ keepalive: true }); });
 
 boot();
 

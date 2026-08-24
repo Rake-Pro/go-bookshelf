@@ -15,10 +15,11 @@
 
 import { api } from '../api.js';
 import { store, deviceName } from '../store.js';
+import { player } from '../player.js';
 import { openBook, readerCSS, isDarkReader } from '../epub.js';
 import { icon, iconButton } from '../components/icons.js';
 import { openSheet } from '../components/sheet.js';
-import { readerSettingsControls } from '../components/reader-settings.js';
+import { readerSettingsControls, TWO_COLUMN_MIN_PX } from '../components/reader-settings.js';
 import { loadingView, errorView } from '../components/states.js';
 import { announce } from '../live.js';
 import { navigate } from '../router.js';
@@ -34,11 +35,15 @@ const ANNOUNCE_MS = 1500;
 const MARGIN_FACTORS = { narrow: 0.6, normal: 1, wide: 1.6 };
 /** Target measure of one column, in ems of the reader's own font size. */
 const COLUMN_EM = 38;
-/** Two columns need at least this much width, and a landscape viewport. */
-const TWO_COLUMN_MIN_PX = 1100;
 /** A section with less text than this is a cover or a title page. */
 const SINGLE_PAGE_CHARS = 400;
 const SWIPE_MIN_PX = 45;
+/** A phone in portrait: the running-head band shrinks so the text gets the room. */
+const SHORT_VIEWPORT_PX = 700;
+/** A height change smaller than this is the mobile URL bar, not a real resize. */
+const URLBAR_FLUTTER_PX = 120;
+/** A pointer that moved more than this between press and release was a drag. */
+const TAP_SLOP_PX = 10;
 
 const reduceMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
@@ -71,8 +76,19 @@ export default async function reader(ctx) {
   let chromeVisible = true;
   /** True while a cover or title page is showing: it gets one centered page. */
   let singlePageSection = false;
+  /** Pending renderer re-layout, so a slider drag re-columnizes once per frame. */
+  let applyRaf = 0;
+  /** True while the position slider is being dragged: relocations must not
+      overwrite the projected readout under the user's thumb. */
+  let scrubbing = false;
+  /** Total locations from the last relocation, for the projected readout. */
+  let lastTotal = 0;
+  /** Viewport at the last re-layout, so URL-bar flutter does not repaginate. */
+  let lastW = window.innerWidth;
+  let lastH = window.innerHeight;
 
   const cleanup = () => {
+    cancelAnimationFrame(applyRaf);
     clearTimeout(saveTimer);
     clearTimeout(hideTimer);
     clearTimeout(resizeTimer);
@@ -81,6 +97,7 @@ export default async function reader(ctx) {
     document.removeEventListener('keydown', onKey, true);
     window.removeEventListener('pagehide', saveNow);
     window.removeEventListener('resize', onResize);
+    for (const [ev, fn] of audioSubs) player.removeEventListener(ev, fn);
     document.documentElement.removeAttribute('data-reader-theme');
     store.applyTheme();
     try { view?.close?.(); } catch { /* already gone */ }
@@ -100,13 +117,42 @@ export default async function reader(ctx) {
   title.className = 'reader-title truncate';
   const tocBtn = iconButton('toc', 'Contents', () => openToc());
   const setBtn = iconButton('gear', 'Reading settings', () => openSettings());
-  top.append(back, title, tocBtn, setBtn);
+  // Audiobook transport, for the case where one is playing while an ebook is
+  // being read: pausing it should not cost the reader their page. Hidden
+  // entirely when no audio is loaded. It takes the reader palette for free,
+  // like every other .iconbtn in this bar.
+  const audioBtn = iconButton('pause', 'Pause audiobook', () => player.toggle());
+  audioBtn.hidden = true;
+  top.append(back, title, audioBtn, tocBtn, setBtn);
+
+  /** Last shape written to the DOM: '' (no audio), 'play' or 'pause'. */
+  let lastAudio = /** @type {string|null} */ (null);
+  function renderAudio() {
+    const on = Boolean(player.item);
+    const want = on ? (player.playing ? 'pause' : 'play') : '';
+    if (want === lastAudio) return;
+    lastAudio = want;
+    audioBtn.hidden = !on;
+    if (!on) return;
+    const label = want === 'pause' ? 'Pause audiobook' : 'Play audiobook';
+    audioBtn.setAttribute('aria-label', label);
+    audioBtn.title = label;
+    audioBtn.replaceChildren(icon(want));
+  }
+  /** @type {[string, () => void][]} */
+  const audioSubs = [];
+  for (const ev of ['load', 'state', 'ended']) {
+    const fn = () => renderAudio();
+    player.addEventListener(ev, fn);
+    audioSubs.push([ev, fn]);
+  }
+  renderAudio();
 
   const bottom = document.createElement('footer');
   bottom.className = 'reader-bar reader-bar--bottom';
   const slider = document.createElement('input');
   slider.type = 'range';
-  slider.className = 'reader-slider';
+  slider.className = 'reader-slider range-touch';
   slider.min = '0';
   slider.max = '1000';
   slider.step = '1';
@@ -121,19 +167,41 @@ export default async function reader(ctx) {
   info.append(context, readout);
   bottom.append(slider, info);
 
+  // Dragging shows where the release would land without navigating there; the
+  // jump happens on release. Without this the readout keeps reporting the page
+  // still on screen, so the slider gives no feedback at all while in use.
+  slider.addEventListener('input', () => {
+    scrubbing = true;
+    const f = Number(slider.value) / 1000;
+    const text = lastTotal > 1
+      ? `Page ${clamp(Math.round(f * lastTotal) + 1, 1, lastTotal)} of ${lastTotal}`
+      : `${percent(f)} through`;
+    readout.textContent = text;
+    slider.setAttribute('aria-valuetext', text);
+  });
   slider.addEventListener('change', () => {
+    scrubbing = false;
     const f = Number(slider.value) / 1000;
     view?.goToFraction(f);
   });
+  // A drag that ends back where it started fires no `change`, so release and
+  // blur clear the flag too rather than leaving the readout frozen.
+  for (const ev of ['pointerup', 'pointercancel', 'blur']) {
+    slider.addEventListener(ev, () => { scrubbing = false; });
+  }
 
-  /* Tap zones. They sit under the bars so the bars stay clickable. */
+  /* Tap zones. Only the left and right gutters take pointer events: the center
+     has to reach the book so in-book links, text selection and the renderer's
+     own touch paging work. The center zone stays a real button for the
+     keyboard; pointer taps in the center are caught by watchTaps() instead. */
   const zones = document.createElement('div');
   zones.className = 'reader-zones';
-  const zPrev = zoneButton('Previous page', () => turn(-1));
-  const zCenter = zoneButton('Show or hide reading controls', () => setChrome(!chromeVisible));
-  const zNext = zoneButton('Next page', () => turn(1));
+  const zPrev = zoneButton('Previous page', () => turn(-1), true);
+  const zCenter = zoneButton('Show or hide reading controls', () => setChrome(!chromeVisible), false);
+  const zNext = zoneButton('Next page', () => turn(1), true);
   zones.append(zPrev, zCenter, zNext);
   addSwipe(zones);
+  watchTaps(stage);
 
   el.append(zones, top, bottom);
 
@@ -200,8 +268,20 @@ export default async function reader(ctx) {
 
       view.addEventListener('relocate', (e) => onRelocate(e.detail));
       view.addEventListener('load', (e) => onSectionLoad(e.detail));
+      // The renderer cancels every in-book link click and re-dispatches it
+      // here. An uncancelled `link` keeps its default, which is the renderer's
+      // own goTo() - exactly what a footnote or a TOC target needs, so it gets
+      // no listener. `external-link` does need one: its default is
+      // `window.open(href)` on the raw attribute, which keeps an opener and
+      // would follow a "javascript:" href out of the sandbox.
+      view.addEventListener('external-link', (e) => {
+        e.preventDefault();
+        const href = e.detail?.href_ || '';
+        if (!/^(https?|mailto):/i.test(href)) return;
+        window.open(href, '_blank', 'noopener,noreferrer');
+      });
 
-      applySettings();
+      applySettings({ immediate: true });
 
       const locator = item?.progress?.locator;
       const fraction = item?.progress?.percent;
@@ -230,14 +310,31 @@ export default async function reader(ctx) {
   };
   requestAnimationFrame(startWhenConnected);
 
+  /**
+   * Showing and hiding the mobile URL bar fires a resize worth 60-100px of
+   * height and nothing else. Re-columnizing on that throws the reader onto a
+   * different page mid-sentence, so only a width change or a height jump big
+   * enough to be a rotation or a split-screen resize re-runs the layout.
+   */
   function onResize() {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => applyLayout(), 150);
+    resizeTimer = setTimeout(() => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      if (w === lastW && Math.abs(h - lastH) < URLBAR_FLUTTER_PX) return;
+      lastW = w;
+      lastH = h;
+      applyLayout();
+    }, 150);
   }
 
   /* ---------- settings ---------- */
 
-  function applySettings() {
+  /**
+   * @param {{immediate?:boolean}} [opts] immediate: re-lay out in this tick
+   *   rather than on the next frame, for the first application on open.
+   */
+  function applySettings(opts = {}) {
     const s = store.reader;
     const root = document.documentElement;
     root.setAttribute('data-reader-theme', s.theme);
@@ -254,10 +351,20 @@ export default async function reader(ctx) {
     }
     if (s.layout === 'scrolled') setChrome(true, { quiet: true });
 
+    if (!view?.renderer) return;
+    // A range slider fires `input` on every pointer sample, and each one would
+    // otherwise re-columnize the whole section. Coalesce to one application per
+    // frame; the callback re-reads the store, so the latest settings win.
+    cancelAnimationFrame(applyRaf);
+    if (opts.immediate) { applyRenderer(); return; }
+    applyRaf = requestAnimationFrame(() => { applyRaf = 0; applyRenderer(); });
+  }
+
+  function applyRenderer() {
     const r = view?.renderer;
     if (!r) return;
     applyLayout();
-    r.setStyles?.(readerCSS(s));
+    r.setStyles?.(readerCSS(store.reader));
   }
 
   /**
@@ -271,7 +378,11 @@ export default async function reader(ctx) {
    *   title page is showing, so it is centered rather than stranded in the
    *   left half of an empty spread.
    * - `gap` (a percentage of the page) and `margin` (the running-head band, in
-   *   px) scale together with the margin setting.
+   *   px) scale together with the margin setting. The band is always empty
+   *   here (no running heads are set), so on a short viewport it shrinks to a
+   *   thin strip instead of eating a tenth of the screen at each end - which
+   *   also stops the renderer from capping full-page images at height minus
+   *   twice the band.
    * - `max-block-size` is raised to the viewport height so the text block fills
    *   it instead of stopping at the renderer's 1440px default.
    */
@@ -284,8 +395,11 @@ export default async function reader(ctx) {
     const h = Math.round(rect.height) || window.innerHeight;
     const factor = MARGIN_FACTORS[s.margin] ?? MARGIN_FACTORS.normal;
 
-    const wantsTwo = s.columns === '2'
-      || (s.columns === 'auto' && w >= TWO_COLUMN_MIN_PX && w > h);
+    // An explicit "Two" is a preference, not an override: two columns on a
+    // phone would give each one a ~180px measure. The settings sheet disables
+    // the option for the same reason, so the two agree.
+    const canTwo = w >= TWO_COLUMN_MIN_PX && w > h;
+    const wantsTwo = canTwo && (s.columns === '2' || s.columns === 'auto');
     const columns = singlePageSection || s.layout === 'scrolled' || !wantsTwo ? 1 : 2;
 
     const attr = (name, value) => {
@@ -296,7 +410,8 @@ export default async function reader(ctx) {
     attr('max-column-count', String(columns));
     attr('max-block-size', `${Math.max(480, h)}px`);
     attr('gap', `${clamp(Math.round(7 * factor * 10) / 10, 3.5, 14)}%`);
-    attr('margin', `${Math.round(clamp(h * 0.055, 30, 72) * factor)}px`);
+    const band = h < SHORT_VIEWPORT_PX ? clamp(h * 0.03, 8, 72) : clamp(h * 0.055, 30, 72);
+    attr('margin', `${Math.round(band * factor)}px`);
     r.toggleAttribute('animated', !reduceMotion());
   }
 
@@ -317,8 +432,16 @@ export default async function reader(ctx) {
 
   function openSettings() {
     setChrome(true);
-    const content = readerSettingsControls(() => applySettings());
-    openSheet(el, 'Reading settings', content, { dock: 'side' });
+    // The side dock only exists from 900px. Narrower than that, a full-height
+    // sheet would cover the very page the settings are meant to preview, so it
+    // opens as a low sheet with no sample box: the real text above it is the
+    // preview.
+    const side = window.matchMedia?.('(min-width: 56.25rem)').matches ?? false;
+    // The controls hang a window resize listener; tie its life to the sheet's.
+    const ac = new AbortController();
+    const content = readerSettingsControls(() => applySettings(), { preview: side, signal: ac.signal });
+    const sheet = openSheet(el, 'Reading settings', content, { dock: side ? 'side' : 'compact' });
+    sheet.addEventListener('sheet-close', () => ac.abort(), { once: true });
   }
 
   function openToc() {
@@ -362,14 +485,18 @@ export default async function reader(ctx) {
   function onRelocate(detail) {
     const fraction = detail?.fraction ?? 0;
     last = { fraction, cfi: detail?.cfi || '' };
-    slider.value = String(Math.round(fraction * 1000));
 
     const loc = detail?.location;
+    lastTotal = Number(loc?.total) > 1 ? Number(loc.total) : 0;
     const text = loc && loc.total > 1
       ? `Page ${loc.current + 1} of ${loc.total}`
       : `${percent(fraction)} through`;
-    readout.textContent = text;
-    slider.setAttribute('aria-valuetext', text);
+    // Mid-drag the slider shows where the release will land; don't fight it.
+    if (!scrubbing) {
+      slider.value = String(Math.round(fraction * 1000));
+      readout.textContent = text;
+      slider.setAttribute('aria-valuetext', text);
+    }
 
     const chapter = detail?.tocItem?.label || '';
     const left = pagesLeftInChapter();
@@ -431,6 +558,8 @@ export default async function reader(ctx) {
     for (const s of Array.from(doc.querySelectorAll('script'))) s.remove();
     // Key events inside the book iframe do not reach the host document.
     doc.addEventListener('keydown', onKey, true);
+    // Nor do clicks, so the center tap is wired per book document.
+    watchTaps(doc);
     for (const a of Array.from(doc.querySelectorAll('a[href]'))) {
       const href = a.getAttribute('href') || '';
       if (/^(https?:)?\/\//i.test(href)) {
@@ -443,10 +572,41 @@ export default async function reader(ctx) {
   /* ---------- gestures ---------- */
 
   /**
-   * Swipe to page, on the tap-zone layer. The book frame is sandboxed without
-   * scripts, so its own touch handling never fires; this is the only source of
-   * gestures. A swipe suppresses the click the browser sends afterwards, so a
-   * flick across the "next page" zone does not also count as a tap.
+   * Toggle the chrome on a tap that is not a drag, a link or a selection.
+   *
+   * The tap-zone layer used to own this, but it covered the whole page and so
+   * swallowed every touch the book itself needed. The zones are edge gutters
+   * now, and the center tap is read where the tap actually lands: on the stage
+   * for the renderer's own margins, and on each book document (clicks do not
+   * cross the iframe boundary). The renderer cancels link clicks before this
+   * listener runs, which is what `defaultPrevented` filters out.
+   *
+   * @param {Document|HTMLElement} target
+   */
+  function watchTaps(target) {
+    let x0 = 0, y0 = 0;
+    target.addEventListener('pointerdown', (e) => {
+      x0 = /** @type {PointerEvent} */ (e).clientX;
+      y0 = /** @type {PointerEvent} */ (e).clientY;
+    }, true);
+    target.addEventListener('click', (e) => {
+      const ev = /** @type {MouseEvent} */ (e);
+      if (ev.defaultPrevented) return;
+      if (Math.abs(ev.clientX - x0) > TAP_SLOP_PX || Math.abs(ev.clientY - y0) > TAP_SLOP_PX) return;
+      const t = /** @type {Element|null} */ (ev.target);
+      if (t?.closest?.('a[href]')) return;
+      const sel = t?.ownerDocument?.getSelection?.();
+      if (sel && !sel.isCollapsed) return;
+      setChrome(!chromeVisible);
+    });
+  }
+
+  /**
+   * Swipe to page, on the tap-zone layer, which is now just the two edge
+   * gutters: in the center the renderer's own touch handling drags the page
+   * with the finger and snaps on release, which is the better gesture. A swipe
+   * suppresses the click the browser sends afterwards, so a flick across the
+   * "next page" zone does not also count as a tap.
    * @param {HTMLElement} layer
    */
   function addSwipe(layer) {
@@ -507,11 +667,11 @@ export default async function reader(ctx) {
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 
-/** @param {string} label @param {() => void} onClick */
-function zoneButton(label, onClick) {
+/** @param {string} label @param {() => void} onClick @param {boolean} edge */
+function zoneButton(label, onClick, edge) {
   const b = document.createElement('button');
   b.type = 'button';
-  b.className = 'reader-zone';
+  b.className = edge ? 'reader-zone reader-zone--edge' : 'reader-zone';
   b.setAttribute('aria-label', label);
   b.addEventListener('click', onClick);
   return b;
@@ -528,6 +688,12 @@ function styleTag() {
   background: var(--reader-bg);
   color: var(--reader-fg);
   overflow: hidden;
+  /* No pull-to-refresh and no scroll chaining out of the reader: a downward
+     drag on the page must never reload the book. */
+  overscroll-behavior: none;
+  /* The floating bars, so the scrolled layout can keep its text clear of them. */
+  --reader-bar-h: calc(var(--tap) + var(--s1) * 2 + 1px);
+  --reader-foot-h: calc(var(--tap) + var(--s6) + var(--s1) * 2 + 1px);
   /* Re-point the shell's tokens at the reader palette so the chrome, the
      sheets and the book page are one surface with no light frame around a
      dark page. */
@@ -550,20 +716,35 @@ function styleTag() {
 }
 .reader-stage foliate-view { display: block; width: 100%; height: 100%; }
 
+/* Scrolled mode pins the bars open, so the text has to start below the top one
+   and stop above the footer. */
+.flow-scrolled .reader-stage {
+  padding-top: calc(var(--reader-bar-h) + env(safe-area-inset-top));
+  padding-bottom: calc(var(--reader-foot-h) + env(safe-area-inset-bottom));
+  overscroll-behavior: contain;
+}
+
 .reader-zones {
   position: absolute;
   inset: 0;
   display: grid;
-  grid-template-columns: 1fr 1.2fr 1fr;
-  touch-action: pan-y pinch-zoom;
+  /* Edge gutters. The center column is transparent to the pointer so in-book
+     links, text selection and the renderer's own drag-to-page reach the book;
+     the center tap is handled by watchTaps() instead. */
+  grid-template-columns: 18% 1fr 18%;
+  pointer-events: none;
 }
 .flow-scrolled .reader-zones { display: none; }
 .reader-zone {
   border: 0;
   background: transparent;
   cursor: pointer;
+  pointer-events: none;
   -webkit-tap-highlight-color: transparent;
 }
+/* Keyboard users still reach the center zone: it is focusable and clickable
+   with Enter, it just never intercepts a pointer. */
+.reader-zone--edge { pointer-events: auto; touch-action: pan-y pinch-zoom; }
 .reader-zone:focus-visible { outline: 3px solid var(--focus); outline-offset: -6px; }
 
 .reader-bar {
@@ -611,47 +792,11 @@ function styleTag() {
 .reader-context { min-width: 0; }
 .reader-readout { flex: none; font-variant-numeric: tabular-nums; }
 
-/* Progress slider: a 44px-tall hit area with a thumb big enough to grab. */
-.reader-slider {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 100%;
-  height: var(--tap);
-  margin: 0;
-  background: transparent;
-  cursor: pointer;
-}
-.reader-slider:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
-.reader-slider::-webkit-slider-runnable-track {
-  height: 4px;
-  border-radius: 2px;
-  background: var(--reader-border);
-}
-.reader-slider::-moz-range-track {
-  height: 4px;
-  border-radius: 2px;
-  background: var(--reader-border);
-}
-.reader-slider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 1.5rem;
-  height: 1.5rem;
-  margin-top: -0.625rem;
-  border: 2px solid var(--reader-chrome);
-  border-radius: 50%;
-  background: var(--reader-link);
-}
-.reader-slider::-moz-range-thumb {
-  width: 1.5rem;
-  height: 1.5rem;
-  border: 2px solid var(--reader-chrome);
-  border-radius: 50%;
-  background: var(--reader-link);
-}
-@media (pointer: coarse) {
-  .reader-slider::-webkit-slider-thumb { width: 2rem; height: 2rem; margin-top: -0.875rem; }
-  .reader-slider::-moz-range-thumb { width: 2rem; height: 2rem; }
-}
+/* Progress slider: a 44px-tall hit area. The track and thumb, including the
+   bigger coarse-pointer thumb, come from .range-touch in app.css, which the
+   audiobook scrubber shares; the reader palette reaches them because .reader
+   re-points --accent, --border and --surface above. */
+.reader-slider { width: 100%; height: var(--tap); margin: 0; }
 
 .chrome-hidden .reader-bar {
   visibility: hidden;

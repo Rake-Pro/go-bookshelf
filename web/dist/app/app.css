@@ -27,6 +27,7 @@ h2 { font-size: 1.2rem; }
 h3 { font-size: 1.05rem; }
 p { margin: 0 0 var(--s3); }
 img { max-width: 100%; }
+code { overflow-wrap: anywhere; }
 
 a { color: var(--accent); }
 a:hover { text-decoration-thickness: 2px; }
@@ -96,6 +97,7 @@ a:hover { text-decoration-thickness: 2px; }
 .iconbtn svg { width: 1.5rem; height: 1.5rem; }
 /* Inline icons inside text buttons/links: never let an SVG take its container's width. */
 .btn svg { width: 1.25rem; height: 1.25rem; flex: 0 0 auto; }
+.formerror svg { width: 1.5rem; height: 1.5rem; flex: 0 0 auto; }
 svg:not([width]):not([height]) { max-width: 100%; }
 .iconbtn[aria-pressed="true"] { background: var(--surface-2); border-color: var(--border); }
 
@@ -111,6 +113,7 @@ svg:not([width]):not([height]) { max-width: 100%; }
 input[type="text"], input[type="password"], input[type="search"],
 input[type="number"], input[type="url"], select, textarea {
   width: 100%;
+  min-width: 0;
   min-height: var(--tap);
   padding: var(--s2) var(--s3);
   font: inherit;
@@ -121,6 +124,48 @@ input[type="number"], input[type="url"], select, textarea {
 }
 textarea { min-height: 6rem; }
 input[type="range"] { width: 100%; height: var(--tap); accent-color: var(--accent); }
+
+/* Slider with a thumb big enough to grab with a thumb. The native control
+   cannot be resized without resetting its appearance first, so the track and
+   thumb are drawn from the surrounding palette; every color is a token, so the
+   reader gets the reading palette for free. Shared by the reader position
+   slider and the audiobook scrubber. */
+.range-touch {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.range-touch::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+}
+.range-touch::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+}
+.range-touch::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 1.5rem;
+  height: 1.5rem;
+  margin-top: -0.625rem;
+  border: 2px solid var(--surface);
+  border-radius: 50%;
+  background: var(--accent);
+}
+.range-touch::-moz-range-thumb {
+  width: 1.5rem;
+  height: 1.5rem;
+  border: 2px solid var(--surface);
+  border-radius: 50%;
+  background: var(--accent);
+}
+@media (pointer: coarse) {
+  .range-touch::-webkit-slider-thumb { width: 2rem; height: 2rem; margin-top: -0.875rem; }
+  .range-touch::-moz-range-thumb { width: 2rem; height: 2rem; }
+}
 input[type="checkbox"], input[type="radio"] { width: 1.25rem; height: 1.25rem; accent-color: var(--accent); }
 label.check { display: flex; align-items: center; gap: var(--s3); min-height: var(--tap); }
 
@@ -212,8 +257,9 @@ label.check { display: flex; align-items: center; gap: var(--s3); min-height: va
   display: flex;
   align-items: center;
   gap: var(--s2);
-  height: var(--appbar-h);
+  height: calc(var(--appbar-h) + env(safe-area-inset-top));
   padding: 0 var(--s2);
+  padding-top: env(safe-area-inset-top);
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
@@ -224,10 +270,13 @@ label.check { display: flex; align-items: center; gap: var(--s3); min-height: va
 main.content {
   grid-area: main;
   padding: var(--s4);
-  padding-bottom: calc(var(--s8) + var(--miniplayer-h) + var(--tabbar-h));
+  padding-bottom: calc(var(--s8) + var(--tabbar-h) + env(safe-area-inset-bottom));
   max-width: 75rem;
   width: 100%;
   margin: 0 auto;
+}
+main.content.has-miniplayer {
+  padding-bottom: calc(var(--s8) + var(--miniplayer-h) + var(--tabbar-h) + env(safe-area-inset-bottom));
 }
 
 .dock {
@@ -241,7 +290,7 @@ main.content {
 
 .tabbar {
   display: flex;
-  height: var(--tabbar-h);
+  height: calc(var(--tabbar-h) + env(safe-area-inset-bottom));
   padding-bottom: env(safe-area-inset-bottom);
 }
 .tabbar a {
@@ -312,8 +361,14 @@ main.content {
     color: var(--accent-text);
     background: var(--accent);
   }
-  main.content { padding: var(--s6); padding-bottom: calc(var(--s8) + var(--miniplayer-h)); }
+  main.content { padding: var(--s6); padding-bottom: calc(var(--s8) + env(safe-area-inset-bottom)); }
+  main.content.has-miniplayer {
+    padding-bottom: calc(var(--s8) + var(--miniplayer-h) + env(safe-area-inset-bottom));
+  }
   .tabbar { display: none; }
+  /* No tab bar here, so the dock itself keeps the mini-player clear of the
+     home indicator. */
+  .dock { padding-bottom: env(safe-area-inset-bottom); }
 }
 
 /* ---------- grids and lists ---------- */

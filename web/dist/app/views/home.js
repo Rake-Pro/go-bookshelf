@@ -10,7 +10,13 @@ import { store } from '../store.js';
 export default async function home(ctx) {
   const name = store.user?.display_name || store.user?.username || '';
   const { el, body } = page('Home', { subtitle: name ? `Signed in as ${name}` : '' });
-  body.replaceChildren(skeletonGrid(6));
+  await load(body);
+  return { el, title: 'Home' };
+}
+
+/** @param {HTMLElement} body */
+async function load(body) {
+  body.replaceChildren(skeletonGrid(6, { rail: true }));
 
   /** @param {string} title @param {any[]} items @param {string} [href] */
   const rail = (title, items, href) => {
@@ -41,10 +47,8 @@ export default async function home(ctx) {
       body.replaceChildren(...parts);
     }
   } catch (e) {
-    body.replaceChildren(errorView(e, () => home(ctx)));
+    body.replaceChildren(errorView(e, () => load(body)));
   }
-
-  return { el, title: 'Home' };
 }
 
 /**

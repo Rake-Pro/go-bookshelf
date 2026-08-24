@@ -89,7 +89,7 @@ Three rules keep this simple:
 | Element | Tag | Notes |
 |---|---|---|
 | Item card | `bs-item-card` | Shadow DOM. One link per tile; accessible name carries title, author, kind and progress. Lazy-loaded 2:3 cover with a text fallback. |
-| Mini player | `bs-mini-player` | Shadow DOM. Hidden until something is loaded. Subscribes to `player` events once, survives shell re-mounts. |
+| Mini player | `bs-mini-player` | Shadow DOM. Hidden until something is loaded, and on the loaded item's own `/listen` page. Subscribes to `player` events once, survives shell re-mounts. |
 | Sheet | `bs-sheet` | Wraps `<dialog>` + `showModal()` for free focus trapping and Escape. Bottom sheet on narrow screens, centered panel from 48rem. |
 | Update toast | `bs-update-toast` | Shadow DOM. Fixed, non-modal banner; shown only once a waiting service worker exists. |
 
@@ -140,7 +140,7 @@ Spacing scale: `--s1 4px`, `--s2 8px`, `--s3 12px`, `--s4 16px`, `--s6 24px`,
 | `/library`, `/library/{id}` | `views/library.js` | yes |
 | `/item/{id}` | `views/item.js` | yes |
 | `/read/{id}` | `views/reader.js` | no |
-| `/listen/{id}` | `views/listen.js` | yes (mini-player stays docked) |
+| `/listen/{id}` | `views/listen.js` | yes (the mini-player hides here: the full player is the page) |
 | `/authors`, `/authors/{id}` | `views/authors.js` | yes |
 | `/series`, `/series/{id}` | `views/series.js` | yes |
 | `/search?q=` | `views/search.js` | yes |
@@ -158,6 +158,13 @@ The server must serve `index.html` for every path that is not `/api/*`,
 Left clicks on same-origin `<a href>` without a modifier, `target`, `download`
 or an absolute scheme are intercepted and turned into `pushState`. Navigation is
 generation-counted, so a slow view cannot overwrite a newer one.
+
+Scroll restoration is manual (`history.scrollRestoration = 'manual'`): the
+router stamps `{bsKey}` into every history entry's state, remembers the
+scroll offset of the entry being left (bounded to the last 50 entries), and
+Back/Forward restore it after the view mounts, clamped to the new page
+height. Fresh navigations still start at the top; chrome-less routes are
+untouched.
 
 ## API endpoints consumed
 
@@ -440,7 +447,9 @@ never has to import the router.
 
 Stored server-side in `user_settings` and mirrored to `localStorage` under
 `bookshelf.settings.v1` (theme and font scale apply before the network answers).
-Writes are merged and debounced 500 ms, and flushed on `pagehide`.
+Writes are merged and debounced 500 ms, and flushed on `pagehide`. A failed
+flush merges the unsent patch back under any newer edits and retries once
+after 5 s; after that it waits for the next edit or `pagehide`.
 
 ### `reader`
 
@@ -516,7 +525,7 @@ change, on resize and on every section load:
 | `max-column-count` | `2` only when the viewport is landscape and at least 1100px wide (the renderer already forces one column in portrait), `1` otherwise and always while a cover or title page is showing |
 | `max-block-size` | the viewport height, so the text block fills it instead of stopping at the renderer's 1440px default |
 | `gap` | `7% x margin factor`, clamped to 3.5-14% |
-| `margin` | the running-head band, `5.5% of the viewport height x margin factor`, clamped to 30-72px |
+| `margin` | the running-head band, `5.5% of the viewport height x margin factor` clamped to 30-72px, or `3% x factor` clamped to 8-72px on viewports under 700px tall |
 | `animated` | set unless `prefers-reduced-motion` |
 
 The margin factor is 0.6 / 1 / 1.6 for `narrow` / `normal` / `wide`. A section
@@ -532,12 +541,17 @@ Interaction:
   key brings them back; `focusin` on a bar cancels the timer and `focusout`
   restarts it. Hidden means `visibility: hidden` plus `inert` and
   `aria-hidden="true"` - never removed from the DOM.
-- Tap zones: left 1fr / center 1.2fr / right 1fr. They are real `<button>`s with
-  labels, so they are keyboard reachable and screen-reader legible. A horizontal
-  drag of 45px or more on the same layer pages instead, and suppresses the click
-  that follows it. The zones are removed in the scrolled reading mode, where
-  they would otherwise swallow scrolling, and the chrome then stays up.
-- Top bar: back, title, contents, settings. Footer: position slider, then the
+- Tap zones: left 18% / center 1fr / right 18%. They are real `<button>`s with
+  labels, so they are keyboard reachable and screen-reader legible, but only
+  the two edge gutters accept pointer events; the center passes touches
+  through to the book, so in-book links and text selection work and the
+  vendored paginator handles finger-tracked drags. Center taps (detected on
+  the stage and on each book document, with 10px slop) toggle the chrome. A
+  horizontal drag of 45px or more on an edge gutter pages and suppresses the
+  click that follows it. The zones are removed in the scrolled reading mode,
+  where they would otherwise swallow scrolling, and the chrome then stays up.
+- Top bar: back, title, an audiobook play/pause (present only while audio is
+  loaded), contents, settings. Footer: position slider, then the
   pages left in the current chapter (or the chapter title when the renderer has
   no page count) and the "Page x of y" readout, which falls back to
   "N% through" when the renderer cannot supply a location count.
@@ -562,6 +576,13 @@ Interaction:
 - Multi-file sequencing: `files` sorted by `seq` become tracks with cumulative
   offsets. `player.position` is always absolute ms. Reaching the end of a file
   loads the next and continues.
+- The position slider is chapter-scoped when the book has two or more
+  chapters: min/max follow the current chapter's absolute bounds (updated on
+  the `chapter` event, held while dragging and applied on release), so a
+  finger has seconds-per-pixel precision instead of minutes. The times row
+  keeps whole-book elapsed/remaining plus a compact chapter readout;
+  `aria-valuetext` names both scopes. With 0-1 chapters it scrubs the whole
+  book as before.
 - `MediaSession`: metadata (chapter title, author, "read by" narrator, cover
   artwork) plus `play`, `pause`, `stop`, `seekbackward`, `seekforward`,
   `previoustrack`/`nexttrack` (previous/next chapter) and `seekto`, with

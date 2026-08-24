@@ -9,7 +9,7 @@ import { api } from '../api.js';
 import { page } from '../components/page.js';
 import { itemGrid } from '../components/item-card.js';
 import { emptyView, errorView, loadingView } from '../components/states.js';
-import { navigate } from '../router.js';
+import { navigate, router } from '../router.js';
 import { announce } from '../live.js';
 
 /** @param {import('../router.js').RouteCtx} ctx */
@@ -78,7 +78,7 @@ export default async function search(ctx) {
     if (seriesList.length) frag.append(heading('Series', 'search-series'), links(seriesList, '/series'));
     body.replaceChildren(frag);
   } catch (e) {
-    body.replaceChildren(errorView(e, () => search(ctx)));
+    body.replaceChildren(errorView(e, () => router.refresh()));
   }
   return { el, title: `Search: ${q}` };
 }
