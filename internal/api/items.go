@@ -129,6 +129,59 @@ func (a *API) patchItem(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, detail)
 }
 
+// deleteItem removes a book from the library: its files on disk, then its
+// catalog record. Admin only, and deliberately in that order - if a file
+// cannot be removed the database row is left alone, so the item never
+// disappears from the catalog while its files silently survive on disk
+// (which a later scan would offer back as a "new" book, undoing the delete
+// the admin asked for).
+//
+// Every path is re-validated against the configured library roots first, the
+// same guard the stream/download/EPUB routes use, so nothing outside a
+// library can ever be touched. Only the item's own file paths are removed -
+// never a directory - so a now-empty book folder is deliberately left behind
+// rather than have this route recurse into removing directories.
+func (a *API) deleteItem(w http.ResponseWriter, r *http.Request) {
+	if requireAdmin(w, r) == nil {
+		return
+	}
+	itemID, ok := pathID(r, "id")
+	if !ok {
+		writeError(w, http.StatusBadRequest, codeBadRequest, "item id must be a positive integer")
+		return
+	}
+	if _, err := a.cat.ItemLibrary(r.Context(), itemID); err != nil {
+		fail(w, err, "delete item")
+		return
+	}
+	paths, err := a.cat.ItemFilePaths(r.Context(), itemID)
+	if err != nil {
+		fail(w, err, "delete item")
+		return
+	}
+	for _, p := range paths {
+		if !a.pathAllowed(r, p) {
+			writeError(w, http.StatusInternalServerError, codeInternal, "a file for this item is outside every library root")
+			return
+		}
+	}
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.Error().Err(err).Int64("item", itemID).Str("path", filepath.Base(p)).
+				Msg("deleting a book file failed; the catalog record was left in place")
+			writeError(w, http.StatusInternalServerError, codeInternal, "could not remove a file for this item")
+			return
+		}
+	}
+	if err := a.cat.DeleteItem(r.Context(), itemID); err != nil {
+		fail(w, err, "delete item")
+		return
+	}
+	a.covers.Remove(itemID)
+	log.Info().Int64("item", itemID).Msg("item deleted")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
 func (a *API) itemCover(w http.ResponseWriter, r *http.Request) {
 	id := requireUser(w, r)
 	if id == nil {

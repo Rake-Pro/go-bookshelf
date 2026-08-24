@@ -262,6 +262,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+p+"/items", a.listItems)
 	mux.HandleFunc("GET "+p+"/items/{id}", a.getItem)
 	mux.HandleFunc("PATCH "+p+"/items/{id}", a.patchItem)
+	mux.HandleFunc("DELETE "+p+"/items/{id}", a.deleteItem)
 	mux.HandleFunc("GET "+p+"/items/{id}/cover", a.itemCover)
 	mux.HandleFunc("GET "+p+"/items/{id}/epub", a.itemEPUBManifest)
 	mux.HandleFunc("GET "+p+"/items/{id}/epub/{path...}", a.itemEPUBResource)

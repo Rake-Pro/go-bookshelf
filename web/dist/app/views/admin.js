@@ -11,6 +11,7 @@ import { icon } from '../components/icons.js';
 import { date, bytes } from '../format.js';
 import { announce } from '../live.js';
 import { addBooksButton } from '../components/add-books.js';
+import { confirmDialog } from '../components/confirm.js';
 
 /** @param {import('../router.js').RouteCtx} ctx */
 export default async function admin(ctx) {
@@ -306,9 +307,9 @@ function createLibraryForm(host) {
 /** @param {HTMLElement} host */
 async function renderUsers(host) {
   host.replaceChildren(loadingView('Loading users'));
-  let data, libData;
+  let data, libData, status;
   try {
-    [data, libData] = await Promise.all([api.users(), api.libraries()]);
+    [data, libData, status] = await Promise.all([api.users(), api.libraries(), api.systemStatus()]);
   } catch (e) {
     host.replaceChildren(errorView(e, () => renderUsers(host)));
     return;
@@ -316,6 +317,17 @@ async function renderUsers(host) {
   const c = card('Users');
   const list = data?.items || [];
   const libraries = libData?.items || [];
+  // Whether a password can currently do anything (composes the setting with
+  // GOBOOKSHELF_ADMIN_RECOVERY, same as the login page and /auth/status), and
+  // whether single sign-on is configured at all - both decide which edit
+  // controls are meaningful to offer, rather than left to fail server-side.
+  const localLogin = status?.local_login !== false;
+  const oidcEnabled = status?.oidc_enabled === true;
+  // How many enabled administrators exist right now, so the delete, role and
+  // disable controls can grey themselves out on the one it would be a
+  // lockout to touch, rather than let the click go to the server and come
+  // back refused.
+  const enabledAdmins = list.filter((u) => u.role === 'admin' && !u.disabled_at).length;
 
   const table = document.createElement('ul');
   table.className = 'linklist';
@@ -337,13 +349,19 @@ async function renderUsers(host) {
     const sp = document.createElement('span');
     sp.className = 'spacer';
     row.append(sp, uploadToggle(u, host));
-    li.append(row, libraryAccessField(u, libraries));
+    const isLastAdmin = u.role === 'admin' && !u.disabled_at && enabledAdmins <= 1;
+    li.append(
+      row,
+      libraryAccessField(u, libraries),
+      userEditDetails(u, host, { localLogin, oidcEnabled, isLastAdmin }),
+      userDeleteControl(u, host, enabledAdmins),
+    );
     table.append(li);
   }
   if (list.length) c.append(table);
   else c.append(emptyView('No users', 'Add the first account below.'));
 
-  c.append(createUserForm(host));
+  c.append(createUserForm(host, localLogin));
   host.replaceChildren(c);
 }
 
@@ -482,8 +500,217 @@ async function loadLibraryAccess(u, libraries, body) {
   body.replaceChildren(list, save, out);
 }
 
+/**
+ * Display name, username, admin-initiated password reset, role and disabled
+ * state - everything `PATCH /users/{id}` accepts, in one form. Each control
+ * greys itself out, with an explanation, exactly where the server would
+ * otherwise refuse it - the house rule that a control whose backing
+ * capability is off must not accept-then-error.
+ *
+ * @param {any} u @param {HTMLElement} host
+ * @param {{localLogin:boolean, oidcEnabled:boolean, isLastAdmin:boolean}} opts
+ */
+function userEditDetails(u, host, opts) {
+  const details = document.createElement('details');
+  details.style.marginTop = 'var(--s2)';
+  const summary = document.createElement('summary');
+  summary.className = 'btn';
+  summary.style.display = 'inline-flex';
+  summary.append(icon('gear'));
+  const st = document.createElement('span');
+  st.textContent = 'Edit';
+  summary.append(st);
+  details.append(summary);
+
+  const form = document.createElement('form');
+  form.style.marginTop = 'var(--s4)';
+  form.noValidate = true;
+
+  const nameField = textField('Display name', 'display_name', '');
+  const nameInput = /** @type {HTMLInputElement} */ (nameField.querySelector('input'));
+  nameInput.value = u.display_name || '';
+
+  // Username: purely cosmetic once bound to an SSO identity - every lookup
+  // after the first sign-in goes by the subject, never by username again.
+  // Unbound, and while single sign-on is configured at all, the current
+  // username is exactly what a first sign-in matches a pre-created account
+  // by; renaming it then would silently break that match for whoever is
+  // still waiting to sign in as this account.
+  const usernameField = textField('Username', 'username', '');
+  const usernameInput = /** @type {HTMLInputElement} */ (usernameField.querySelector('input'));
+  usernameInput.value = u.username;
+  const usernameLocked = opts.oidcEnabled && !u.oidc_linked;
+  if (usernameLocked) {
+    usernameInput.disabled = true;
+    usernameField.append(hintEl('Cannot be renamed until this account signs in through SSO once - '
+      + 'that is what matches it to a new sign-in by name.'));
+  }
+
+  // Password reset only does anything while password sign-in is available -
+  // and off is deployment-wide, not a per-account exception, so it is left
+  // out entirely rather than greyed: the grey-not-error rule is for a
+  // control someone could reasonably expect to use, not one that can never
+  // do anything on this server at all.
+  const pwField = opts.localLogin
+    ? textField('Reset password', 'password', 'Leave blank to keep the current password', 'password')
+    : null;
+
+  // Role and disabled state can each lock every administrator out; grey them
+  // on your own row (the server refuses both unconditionally) and on the
+  // last enabled administrator's row (refused so nobody is left).
+  const lockedForAdminCount = u.id === store.user?.id || opts.isLastAdmin;
+  const lockReason = u.id === store.user?.id
+    ? (field) => `You cannot ${field} your own account.`
+    : () => 'This is the last administrator; promote another account first.';
+
+  const roleField = document.createElement('label');
+  roleField.className = 'field';
+  const roleLabel = document.createElement('span');
+  roleLabel.className = 'label';
+  roleLabel.textContent = 'Role';
+  const roleSelect = document.createElement('select');
+  roleSelect.name = 'role';
+  for (const [v, t] of [['user', 'User'], ['restricted', 'Restricted'], ['admin', 'Admin']]) {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = t;
+    if (v === u.role) o.selected = true;
+    roleSelect.append(o);
+  }
+  roleField.append(roleLabel, roleSelect);
+  if (lockedForAdminCount) {
+    roleSelect.disabled = true;
+    roleField.append(hintEl(lockReason('change the role of')));
+  }
+
+  const disabledField = document.createElement('div');
+  disabledField.className = 'field';
+  const disabledRow = document.createElement('label');
+  disabledRow.className = 'check';
+  const disabledBox = document.createElement('input');
+  disabledBox.type = 'checkbox';
+  disabledBox.name = 'disabled';
+  disabledBox.checked = Boolean(u.disabled_at);
+  const disabledText = document.createElement('span');
+  disabledText.textContent = 'Account disabled';
+  disabledRow.append(disabledBox, disabledText);
+  disabledField.append(disabledRow);
+  if (lockedForAdminCount) {
+    disabledBox.disabled = true;
+    disabledField.append(hintEl(lockReason('disable')));
+  }
+
+  const submit = document.createElement('button');
+  submit.type = 'submit';
+  submit.className = 'btn btn--primary';
+  submit.textContent = 'Save';
+  const out = document.createElement('div');
+
+  form.append(nameField, usernameField, ...(pwField ? [pwField] : []), roleField, disabledField, submit, out);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const patch = {};
+    const newName = String(fd.get('display_name') || '').trim();
+    if (newName !== (u.display_name || '')) patch.display_name = newName;
+    if (!usernameLocked) {
+      const newUsername = String(fd.get('username') || '').trim();
+      if (newUsername && newUsername !== u.username) patch.username = newUsername;
+    }
+    if (opts.localLogin) {
+      const newPassword = String(fd.get('password') || '');
+      if (newPassword) patch.password = newPassword;
+    }
+    if (!lockedForAdminCount) {
+      const newRole = String(fd.get('role') || u.role);
+      if (newRole !== u.role) patch.role = newRole;
+      const newDisabled = fd.get('disabled') === 'on';
+      if (newDisabled !== Boolean(u.disabled_at)) patch.disabled = newDisabled;
+    }
+    if (Object.keys(patch).length === 0) return;
+    submit.disabled = true;
+    out.replaceChildren();
+    try {
+      await api.updateUser(u.id, patch);
+      announce(`Saved ${u.username}`);
+      renderUsers(host);
+    } catch (err) {
+      out.replaceChildren(flash(errorMessage(err), 'error'));
+      submit.disabled = false;
+    }
+  });
+
+  details.append(form);
+  return details;
+}
+
+/** @param {string} text */
+function hintEl(text) {
+  const h = document.createElement('span');
+  h.className = 'hint';
+  h.textContent = text;
+  return h;
+}
+
+/**
+ * The delete control. Greyed out - never accept-then-error - on the two
+ * accounts the server would refuse anyway: your own, and the last enabled
+ * administrator.
+ *
+ * @param {any} u @param {HTMLElement} host @param {number} enabledAdmins
+ */
+function userDeleteControl(u, host, enabledAdmins) {
+  const wrap = document.createElement('div');
+  wrap.className = 'row';
+  wrap.style.marginTop = 'var(--s2)';
+
+  const isSelf = u.id === store.user?.id;
+  const isLastAdmin = u.role === 'admin' && !u.disabled_at && enabledAdmins <= 1;
+
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'btn btn--danger';
+  del.append(icon('close'));
+  const label = document.createElement('span');
+  label.textContent = 'Delete';
+  del.append(label);
+  const out = document.createElement('div');
+
+  if (isSelf || isLastAdmin) {
+    del.disabled = true;
+    del.setAttribute('aria-disabled', 'true');
+    del.title = isSelf
+      ? 'You cannot delete your own account.'
+      : 'This is the last administrator; promote another account first.';
+  } else {
+    del.addEventListener('click', async () => {
+      const ok = await confirmDialog(wrap, {
+        heading: 'Delete user',
+        message: `Delete ${u.display_name || u.username} (${u.username})? This removes their library access, `
+          + 'settings, progress and bookmarks. This cannot be undone.',
+        confirmLabel: 'Delete',
+        danger: true,
+      });
+      if (!ok) return;
+      del.disabled = true;
+      out.replaceChildren();
+      try {
+        await api.deleteUser(u.id);
+        announce(`Deleted ${u.username}`);
+        renderUsers(host);
+      } catch (err) {
+        del.disabled = false;
+        out.replaceChildren(flash(errorMessage(err), 'error'));
+      }
+    });
+  }
+
+  wrap.append(del, out);
+  return wrap;
+}
+
 /** @param {HTMLElement} host */
-function createUserForm(host) {
+function createUserForm(host, localLogin) {
   const details = document.createElement('details');
   details.style.marginTop = 'var(--s4)';
   const summary = document.createElement('summary');
@@ -532,10 +759,17 @@ function createUserForm(host) {
   submit.textContent = 'Create user';
   const out = document.createElement('div');
 
+  // Password sign-in off means a password set here could never be used to
+  // sign in with, and off is deployment-wide rather than a per-account
+  // exception - so the field is left out entirely rather than offered
+  // greyed, and the account is created by username alone for single sign-on
+  // to adopt on its first login (docs/DESIGN.md, "OIDC group mapping").
+  const pwField = localLogin ? textField('Password', 'password', '', 'password') : null;
+
   form.append(
     textField('Username', 'username', ''),
     textField('Display name', 'display_name', ''),
-    textField('Password', 'password', '', 'password'),
+    ...(pwField ? [pwField] : []),
     roleWrap, uploadWrap, submit, out,
   );
 
@@ -549,8 +783,9 @@ function createUserForm(host) {
       role: String(fd.get('role') || 'user'),
       can_upload: fd.get('can_upload') === 'on',
     };
-    if (!body.username || !body.password) {
-      out.replaceChildren(flash('Username and password are required.', 'error'));
+    if (!body.username || (localLogin && !body.password)) {
+      out.replaceChildren(flash(
+        localLogin ? 'Username and password are required.' : 'Username is required.', 'error'));
       return;
     }
     submit.disabled = true;

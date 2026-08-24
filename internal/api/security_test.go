@@ -269,6 +269,7 @@ func TestSecurityAuthBypass(t *testing.T) {
 		{http.MethodGet, "/api/v1/items"},
 		{http.MethodGet, "/api/v1/items/" + itoa(itemID)},
 		{http.MethodPatch, "/api/v1/items/" + itoa(itemID)},
+		{http.MethodDelete, "/api/v1/items/" + itoa(itemID)},
 		{http.MethodGet, "/api/v1/items/" + itoa(itemID) + "/cover"},
 		{http.MethodGet, "/api/v1/items/" + itoa(itemID) + "/epub"},
 		{http.MethodGet, "/api/v1/items/" + itoa(itemID) + "/epub/OEBPS/chapter1.xhtml"},
@@ -540,6 +541,7 @@ func TestSecurityCrossLibraryAccess(t *testing.T) {
 		{http.MethodPost, "/api/v1/libraries"},
 		{http.MethodPost, "/api/v1/libraries/" + itoa(deniedLib) + "/scan"},
 		{http.MethodPatch, "/api/v1/items/" + itoa(hiddenEbook)},
+		{http.MethodDelete, "/api/v1/items/" + itoa(hiddenEbook)},
 	} {
 		rec := h.do(route.method, route.path, map[string]any{}, withCookie(userSID))
 		if rec.Code != http.StatusForbidden {

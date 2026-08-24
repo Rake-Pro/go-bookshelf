@@ -77,6 +77,8 @@ Three rules keep this simple:
 | `app/components/item-card.js` | `<bs-item-card>`, `itemCard()`, `itemGrid()` |
 | `app/components/mini-player.js` | `<bs-mini-player>` |
 | `app/components/sheet.js` | `<bs-sheet>` modal bottom sheet, `openSheet()` |
+| `app/components/confirm.js` | `confirmDialog()`: a sheet-based Cancel/confirm prompt for destructive actions |
+| `app/components/update-toast.js` | `<bs-update-toast>`, `showUpdateToast()`: the SW-update banner |
 | `app/components/reader-settings.js` | Reader settings controls (reader + settings page) |
 | `app/components/add-books.js` | `addBooksButton()`, `openAddBooks()`: the upload / URL-import sheet |
 | `app/views/*.js` | One module per route |
@@ -89,6 +91,7 @@ Three rules keep this simple:
 | Item card | `bs-item-card` | Shadow DOM. One link per tile; accessible name carries title, author, kind and progress. Lazy-loaded 2:3 cover with a text fallback. |
 | Mini player | `bs-mini-player` | Shadow DOM. Hidden until something is loaded. Subscribes to `player` events once, survives shell re-mounts. |
 | Sheet | `bs-sheet` | Wraps `<dialog>` + `showModal()` for free focus trapping and Escape. Bottom sheet on narrow screens, centered panel from 48rem. |
+| Update toast | `bs-update-toast` | Shadow DOM. Fixed, non-modal banner; shown only once a waiting service worker exists. |
 
 `add-books.js` renders inside `bs-sheet`, so its content lives in that shadow
 root and `app.css` does not reach it; the styles it needs travel with it as a
@@ -221,6 +224,7 @@ status line under each card is an `aria-live="polite"` region.
 | `GET /home` | `{continue:[Item], recent:[Item], series_in_progress:[{series:{id,name}, finished, total, next_item}]}` |
 | `GET /items?library=&kind=&sort=&limit=&offset=&q=&tag=` | `{items:[Item], total}` |
 | `GET /items/{id}` | full `Item` (below) |
+| `DELETE /items/{id}` (admin) | `{status:"deleted"}`; removes the file(s) on disk and the catalog record |
 | `GET /authors?limit=` | `{items:[{id, name, item_count?}], total}` |
 | `GET /authors/{id}` | `{author:{id, name, item_count}, items:[Item], total}` |
 | `GET /series?limit=` | `{items:[{id, name, item_count?}], total}` |
@@ -316,15 +320,38 @@ Notes for the backend:
 | `DELETE /libraries/{id}` | - |
 | `POST /libraries/{id}/scan` | `{scan_id}` |
 | `GET /libraries/{id}/scans` | `{items:[{id, started_at, finished_at, added, updated, removed, errors}]}` newest first |
-| `GET /users` | `{items:[{id, username, display_name, role, disabled_at}]}` |
-| `POST /users` | `{username, display_name, password, role, can_upload?}` |
-| `PATCH /users/{id}` | partial user |
+| `GET /users` | `{items:[{id, username, display_name, role, disabled_at, oidc_linked}]}`; `oidc_linked` is derived from `oidc_subject`, never the subject itself |
+| `POST /users` | `{username, display_name, password, role, can_upload?}`; `password` may be omitted/blank to pre-create an SSO-only account |
+| `PATCH /users/{id}` | partial user; `username` (see below), `display_name`, `password` (admin-initiated reset), `role`, `disabled` |
+| `DELETE /users/{id}` | `{status:"deleted"}`; 400 on your own account or the last administrator |
 | `GET /users/{id}/libraries` | `{user_id, libraries:[id]}` |
 | `PUT /users/{id}/libraries` | `{libraries:[id]}` |
 | `GET /system/status` | `{version, db_driver, db_dsn (redacted), db_size_bytes (0 on Postgres), counts:{ebooks, audiobooks}, libraries, users, last_scans, oidc_enabled, local_login, settings_updated_at, base_url, ...}` |
 
 The scan button polls `GET /libraries/{id}/scans` every 2 s for up to 2 minutes
 and reads the newest entry; a row with `finished_at: null` renders as running.
+
+Each user's Edit disclosure reads `GET /system/status`'s `local_login` and
+`oidc_enabled` (fetched alongside `GET /users` and `GET /libraries` when the
+Users panel loads) plus the row's own `role`/`disabled_at`/`oidc_linked` to
+decide what to grey out - or, for password sign-in, leave out entirely -
+rather than let the save come back refused:
+- **Reset password** is not rendered at all when `local_login` is false, and
+  neither is its label or hint: the capability is off for the whole
+  deployment, not a per-account exception, so the grey-not-error rule (a
+  control someone could reasonably expect to use) does not apply the same
+  way it does to username/role/disabled below - there is nothing to grey,
+  only something to omit, and the field must not leave a labeled gap where
+  it would have been.
+- **Username** is disabled, with a hint, when `oidc_enabled` is true and the
+  row's `oidc_linked` is false - see docs/DESIGN.md's "Username rename".
+- **Role** and **Disabled** are each disabled, with a hint naming which,
+  on your own row (unconditionally) and on the row that is currently the
+  last enabled administrator (`role === 'admin' && !disabled_at`, and no
+  other row satisfies the same test).
+The **Add user** form's password field is the same: omitted, not greyed,
+under the same `local_login` check, and an account is created by username
+alone for single sign-on to adopt on its first login.
 
 ### Adding books
 
@@ -565,6 +592,18 @@ Interaction:
   - offline fallback page is inlined in the worker
 
 Bump `VERSION` in `sw.js` whenever anything in `web/dist/` changes.
+
+Update handoff: a new worker installs and precaches in the background but
+never calls `skipWaiting()` itself, so it never swaps out from under a page
+mid-session - an audiobook playing in the mini-player must not be interrupted
+by a deploy. `main.js` watches the registration (`updatefound` /
+`statechange`, plus a `waiting` worker already present at load) and shows
+`<bs-update-toast>` once a worker is waiting with an existing controller (a
+first-ever install has no controller and shows nothing). Clicking Refresh
+posts `{type:'SKIP_WAITING'}` to the waiting worker; the worker's message
+handler calls `self.skipWaiting()`, `clients.claim()` on `activate` hands it
+every open tab, and a one-shot `controllerchange` listener reloads the page -
+guarded so it cannot fire more than once.
 
 ## Accessibility contract
 

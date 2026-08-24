@@ -8,6 +8,7 @@ import { setUnauthorizedHandler, setSetupRequiredHandler, probeAuth } from './ap
 import { store } from './store.js';
 import { createShell } from './components/app-shell.js';
 import { loadingView, errorView } from './components/states.js';
+import { showUpdateToast } from './components/update-toast.js';
 
 /* Routes. `chrome:false` means the view replaces the whole shell. */
 router
@@ -100,8 +101,47 @@ boot();
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(() => {
+    navigator.serviceWorker.register('/sw.js').then((reg) => {
+      // A worker already waiting when this tab loaded - it finished
+      // installing while the tab was backgrounded - gets the same banner as
+      // one that finishes during this session.
+      if (reg.waiting && navigator.serviceWorker.controller) notifyUpdate(reg);
+      reg.addEventListener('updatefound', () => {
+        const installing = reg.installing;
+        if (!installing) return;
+        installing.addEventListener('statechange', () => {
+          // A controller already existing is what tells "installed" apart
+          // from "this is the very first install": that one has nothing to
+          // hand off to and needs no banner.
+          if (installing.state === 'installed' && navigator.serviceWorker.controller) {
+            notifyUpdate(reg);
+          }
+        });
+      });
+    }).catch(() => {
       // A failed registration only costs offline support.
     });
+
+    // The new worker takes over exactly once control is handed to it; reload
+    // then, and only then, so a second event (there should never be one)
+    // cannot loop the page.
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (reloaded) return;
+      reloaded = true;
+      location.reload();
+    });
+  });
+}
+
+/**
+ * Tell the person a new version is ready and, if they act on it, hand
+ * control to the worker that is waiting for it. The controllerchange
+ * listener above reloads the page once that worker actually takes over.
+ * @param {ServiceWorkerRegistration} reg
+ */
+function notifyUpdate(reg) {
+  showUpdateToast(() => {
+    reg.waiting?.postMessage({ type: 'SKIP_WAITING' });
   });
 }

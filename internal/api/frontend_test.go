@@ -2,6 +2,8 @@ package api_test
 
 import (
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -792,5 +794,353 @@ func TestFrontendAdminSettingsContract(t *testing.T) {
 		if _, ok := sys[key]; !ok {
 			t.Errorf("system status is missing %q: %s", key, status.Body.String())
 		}
+	}
+}
+
+// The admin page's book-removal control deletes both the catalog record and
+// the file(s) on disk, tolerates a file that is already gone by hand, and a
+// rescan afterward must not resurrect what was deleted.
+func TestFrontendItemDeleteContract(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	libID := h.seedLibrary(sid, "Deletable", h.media)
+
+	ebookID := h.firstItemID(sid, "ebook")
+	audioID := h.firstItemID(sid, "audiobook")
+
+	// seedLibrary always writes these two fixture files; paths are never sent
+	// to a client, so this checks the filesystem directly rather than reading
+	// them back through the API.
+	epubPath := filepath.Join(h.media, "afternoon.epub")
+	audioPath := filepath.Join(h.media, "evening.m4b")
+	if _, err := os.Stat(epubPath); err != nil {
+		t.Fatalf("fixture file missing before delete: %v", err)
+	}
+
+	/* ---- a plain user cannot delete, even one it can see ---- */
+
+	userSID := h.createUser(sid, "reader", []int64{libID})
+	forbidden := h.do(http.MethodDelete, "/api/v1/items/"+itoa(ebookID), nil, withCookie(userSID))
+	if forbidden.Code != http.StatusForbidden {
+		t.Errorf("delete item as a plain user = %d, want 403", forbidden.Code)
+	}
+	if _, err := os.Stat(epubPath); err != nil {
+		t.Errorf("file removed by a request that should have been refused: %v", err)
+	}
+
+	/* ---- deleting removes the file and the catalog record ---- */
+
+	del := h.do(http.MethodDelete, "/api/v1/items/"+itoa(ebookID), nil, withCookie(sid))
+	if del.Code != http.StatusOK {
+		t.Fatalf("delete item = %d: %s", del.Code, del.Body.String())
+	}
+	if _, err := os.Stat(epubPath); !os.IsNotExist(err) {
+		t.Errorf("file still exists after delete: stat err = %v", err)
+	}
+	if getRec := h.do(http.MethodGet, "/api/v1/items/"+itoa(ebookID), nil, withCookie(sid)); getRec.Code != http.StatusNotFound {
+		t.Errorf("get deleted item = %d, want 404", getRec.Code)
+	}
+
+	// Deleting it again finds no catalog row - a plain 404, not a crash on a
+	// file that is now doubly gone.
+	if redo := h.do(http.MethodDelete, "/api/v1/items/"+itoa(ebookID), nil, withCookie(sid)); redo.Code != http.StatusNotFound {
+		t.Errorf("re-delete of an already-deleted item = %d, want 404", redo.Code)
+	}
+
+	// A rescan must not resurrect it: the file is gone, so there is nothing
+	// left to ingest.
+	if rescan := h.do(http.MethodPost, "/api/v1/libraries/"+itoa(libID)+"/scan", nil, withCookie(sid)); rescan.Code != http.StatusOK {
+		t.Fatalf("rescan = %d: %s", rescan.Code, rescan.Body.String())
+	}
+	itemsRec := h.do(http.MethodGet, "/api/v1/items?library="+itoa(libID)+"&kind=ebook", nil, withCookie(sid))
+	var afterRescan struct {
+		Total int `json:"total"`
+	}
+	decode(t, itemsRec, &afterRescan)
+	if afterRescan.Total != 0 {
+		t.Errorf("ebooks after delete+rescan = %d, want 0 (the delete was undone)", afterRescan.Total)
+	}
+
+	/* ---- missing-file tolerance: the file is already gone by hand ---- */
+
+	if err := os.Remove(audioPath); err != nil {
+		t.Fatalf("removing the fixture ahead of the test: %v", err)
+	}
+	del2 := h.do(http.MethodDelete, "/api/v1/items/"+itoa(audioID), nil, withCookie(sid))
+	if del2.Code != http.StatusOK {
+		t.Fatalf("delete item with a file already gone = %d: %s", del2.Code, del2.Body.String())
+	}
+	if getRec2 := h.do(http.MethodGet, "/api/v1/items/"+itoa(audioID), nil, withCookie(sid)); getRec2.Code != http.StatusNotFound {
+		t.Errorf("get item deleted with a missing file = %d, want 404", getRec2.Code)
+	}
+
+	/* ---- deleting a nonexistent item is a 404, not a 500 ---- */
+
+	if gone := h.do(http.MethodDelete, "/api/v1/items/999999", nil, withCookie(sid)); gone.Code != http.StatusNotFound {
+		t.Errorf("delete nonexistent item = %d, want 404", gone.Code)
+	}
+}
+
+// Deleting a user cascades everything it owns (sessions, tokens, library
+// grants, settings, progress, bookmarks), and an administrator can never
+// delete their own account. AdminCount's own arithmetic - disabled and
+// demoted administrators do not count - is exercised directly in
+// internal/auth/auth_test.go; deleteUser's AdminCount<=1 branch is
+// structurally unreachable through this route: the caller must itself be an
+// enabled administrator, so a target that is the *only* enabled administrator
+// is always the caller's own account, which the self-delete guard above it
+// already refuses first.
+func TestAdminUserDeletion(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	libID := h.seedLibrary(sid, "Shared", h.media)
+
+	if rec := h.do(http.MethodDelete, "/api/v1/users/1", nil, withCookie(sid)); rec.Code != http.StatusBadRequest {
+		t.Errorf("self-delete = %d, want 400", rec.Code)
+	}
+
+	// A second administrator can be deleted while the first remains.
+	second := h.do(http.MethodPost, "/api/v1/users", map[string]any{
+		"username": "deputy", "password": "another-long-password",
+		"display_name": "Deputy", "role": "admin",
+	}, withCookie(sid))
+	if second.Code != http.StatusCreated {
+		t.Fatalf("create second admin = %d: %s", second.Code, second.Body.String())
+	}
+	var deputy struct {
+		ID int64 `json:"id"`
+	}
+	decode(t, second, &deputy)
+	if del := h.do(http.MethodDelete, "/api/v1/users/"+itoa(deputy.ID), nil, withCookie(sid)); del.Code != http.StatusOK {
+		t.Fatalf("delete second admin = %d: %s", del.Code, del.Body.String())
+	}
+
+	/* ---- deleting an ordinary user cascades what it owns ---- */
+
+	userSID := h.createUser(sid, "reader", []int64{libID})
+	itemID := h.firstItemID(userSID, "")
+	if rec := h.do(http.MethodPost, "/api/v1/me/bookmarks",
+		map[string]any{"item_id": itemID, "position_ms": 1000}, withCookie(userSID)); rec.Code != http.StatusCreated {
+		t.Fatalf("create bookmark = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := h.do(http.MethodPut, "/api/v1/me/progress/"+itoa(itemID),
+		map[string]any{"percent": 0.1, "device": "test"}, withCookie(userSID)); rec.Code != http.StatusOK {
+		t.Fatalf("save progress = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	usersRec := h.do(http.MethodGet, "/api/v1/users", nil, withCookie(sid))
+	var userList struct {
+		Items []struct {
+			ID       int64  `json:"id"`
+			Username string `json:"username"`
+		} `json:"items"`
+	}
+	decode(t, usersRec, &userList)
+	var readerID int64
+	for _, u := range userList.Items {
+		if u.Username == "reader" {
+			readerID = u.ID
+		}
+	}
+	if readerID == 0 {
+		t.Fatalf("reader not in user list: %s", usersRec.Body.String())
+	}
+
+	if del := h.do(http.MethodDelete, "/api/v1/users/"+itoa(readerID), nil, withCookie(sid)); del.Code != http.StatusOK {
+		t.Fatalf("delete reader = %d: %s", del.Code, del.Body.String())
+	}
+
+	// The session cascade took its row with it: the cookie the browser still
+	// holds no longer authenticates anything.
+	if rec := h.do(http.MethodGet, "/api/v1/auth/me", nil, withCookie(userSID)); rec.Code != http.StatusUnauthorized {
+		t.Errorf("session of a deleted user = %d, want 401", rec.Code)
+	}
+
+	afterRec := h.do(http.MethodGet, "/api/v1/users", nil, withCookie(sid))
+	var afterList struct {
+		Items []struct {
+			Username string `json:"username"`
+		} `json:"items"`
+	}
+	decode(t, afterRec, &afterList)
+	for _, u := range afterList.Items {
+		if u.Username == "reader" {
+			t.Errorf("deleted user still listed: %s", afterRec.Body.String())
+		}
+	}
+}
+
+// The admin-initiated password reset and display-name edit both go through
+// PATCH /users/{id}, which already carried the fields; this pins that a reset
+// password actually authenticates and the old one no longer does.
+func TestAdminUserPasswordResetAndDisplayName(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	_ = h.createUser(sid, "reader", nil)
+
+	usersRec := h.do(http.MethodGet, "/api/v1/users", nil, withCookie(sid))
+	var userList struct {
+		Items []struct {
+			ID       int64  `json:"id"`
+			Username string `json:"username"`
+		} `json:"items"`
+	}
+	decode(t, usersRec, &userList)
+	var readerID int64
+	for _, u := range userList.Items {
+		if u.Username == "reader" {
+			readerID = u.ID
+		}
+	}
+	if readerID == 0 {
+		t.Fatalf("reader not in user list: %s", usersRec.Body.String())
+	}
+
+	patch := h.do(http.MethodPatch, "/api/v1/users/"+itoa(readerID),
+		map[string]any{"display_name": "Renamed Reader", "password": "brand-new-long-password"}, withCookie(sid))
+	if patch.Code != http.StatusOK {
+		t.Fatalf("patch user = %d: %s", patch.Code, patch.Body.String())
+	}
+	var patched struct {
+		DisplayName string `json:"display_name"`
+	}
+	decode(t, patch, &patched)
+	if patched.DisplayName != "Renamed Reader" {
+		t.Errorf("display_name after patch = %q", patched.DisplayName)
+	}
+
+	if rec := h.do(http.MethodPost, "/api/v1/auth/login",
+		map[string]string{"username": "reader", "password": "another-long-password"}); rec.Code != http.StatusUnauthorized {
+		t.Errorf("login with the old password = %d, want 401", rec.Code)
+	}
+	if rec := h.do(http.MethodPost, "/api/v1/auth/login",
+		map[string]string{"username": "reader", "password": "brand-new-long-password"}); rec.Code != http.StatusOK {
+		t.Errorf("login with the reset password = %d, want 200", rec.Code)
+	}
+}
+
+// Username rename goes through the same PATCH as display name and password.
+// With OIDC not configured, nothing protects it beyond the case-insensitive
+// collision check every other username lookup already folds.
+func TestAdminUsernameRename(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	_ = h.createUser(sid, "reader", nil)
+	_ = h.createUser(sid, "other", nil)
+
+	readerID := userIDByUsername(t, h, sid, "reader")
+
+	patch := h.do(http.MethodPatch, "/api/v1/users/"+itoa(readerID),
+		map[string]any{"username": "renamed-reader"}, withCookie(sid))
+	if patch.Code != http.StatusOK {
+		t.Fatalf("rename = %d: %s", patch.Code, patch.Body.String())
+	}
+	var patched struct {
+		Username string `json:"username"`
+	}
+	decode(t, patch, &patched)
+	if patched.Username != "renamed-reader" {
+		t.Errorf("username after rename = %q", patched.Username)
+	}
+
+	// The account authenticates under the new name.
+	login := h.do(http.MethodPost, "/api/v1/auth/login",
+		map[string]string{"username": "renamed-reader", "password": "another-long-password"})
+	if login.Code != http.StatusOK {
+		t.Errorf("login with the renamed username = %d, want 200", login.Code)
+	}
+
+	// A case-different collision with the other account is refused.
+	collide := h.do(http.MethodPatch, "/api/v1/users/"+itoa(readerID),
+		map[string]any{"username": "OTHER"}, withCookie(sid))
+	if collide.Code != http.StatusConflict {
+		t.Errorf("rename onto an existing username (different case) = %d, want 409: %s", collide.Code, collide.Body.String())
+	}
+}
+
+// userIDByUsername looks a user up in GET /users by name.
+func userIDByUsername(t *testing.T, h *harness, sid, username string) int64 {
+	t.Helper()
+	rec := h.do(http.MethodGet, "/api/v1/users", nil, withCookie(sid))
+	var list struct {
+		Items []struct {
+			ID       int64  `json:"id"`
+			Username string `json:"username"`
+		} `json:"items"`
+	}
+	decode(t, rec, &list)
+	for _, u := range list.Items {
+		if u.Username == username {
+			return u.ID
+		}
+	}
+	t.Fatalf("%q not in user list: %s", username, rec.Body.String())
+	return 0
+}
+
+// Every mutation that can turn an enabled administrator into a non-admin -
+// role demotion, disabling the account, deleting it - is refused when that
+// account is the last one. The self-guards (an administrator cannot touch
+// its own role or disabled state at all, regardless of how many other
+// admins exist) predate this task and are pinned here as a regression check;
+// the AdminCount-based checks added alongside them are additional
+// defense-in-depth for a target that is *not* the caller - which, like the
+// equivalent delete guard, cannot actually be reached through a single
+// sequential request (the caller must itself be an enabled admin, so a
+// target that is the only one left is always the caller's own account, and
+// that path is already refused by the self-guard first). What genuinely
+// closes a reachable gap is internal/auth/oidc.go's role re-sync on sign-in,
+// which does not go through this handler at all and is covered by
+// TestOIDCDoesNotDemoteTheLastEnabledAdmin.
+func TestAdminLastAdminGuards(t *testing.T) {
+	h := newHarness(t)
+	sid := h.setupAdmin()
+	adminID := userIDByUsername(t, h, sid, "admin")
+
+	if rec := h.do(http.MethodPatch, "/api/v1/users/"+itoa(adminID),
+		map[string]any{"role": "user"}, withCookie(sid)); rec.Code != http.StatusBadRequest {
+		t.Errorf("self-demote as the only admin = %d, want 400", rec.Code)
+	}
+	if rec := h.do(http.MethodPatch, "/api/v1/users/"+itoa(adminID),
+		map[string]any{"disabled": true}, withCookie(sid)); rec.Code != http.StatusBadRequest {
+		t.Errorf("self-disable as the only admin = %d, want 400", rec.Code)
+	}
+
+	// A second administrator: demoting or disabling *that one* is fine,
+	// since the first remains - proves the new checks do not over-block a
+	// legitimate change.
+	second := h.do(http.MethodPost, "/api/v1/users", map[string]any{
+		"username": "deputy", "password": "another-long-password",
+		"display_name": "Deputy", "role": "admin",
+	}, withCookie(sid))
+	if second.Code != http.StatusCreated {
+		t.Fatalf("create second admin = %d: %s", second.Code, second.Body.String())
+	}
+	var deputy struct {
+		ID int64 `json:"id"`
+	}
+	decode(t, second, &deputy)
+
+	if rec := h.do(http.MethodPatch, "/api/v1/users/"+itoa(deputy.ID),
+		map[string]any{"role": "user"}, withCookie(sid)); rec.Code != http.StatusOK {
+		t.Fatalf("demote the second admin while the first remains = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := h.do(http.MethodPatch, "/api/v1/users/"+itoa(deputy.ID),
+		map[string]any{"role": "admin"}, withCookie(sid)); rec.Code != http.StatusOK {
+		t.Fatalf("promote the second admin back = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := h.do(http.MethodPatch, "/api/v1/users/"+itoa(deputy.ID),
+		map[string]any{"disabled": true}, withCookie(sid)); rec.Code != http.StatusOK {
+		t.Fatalf("disable the second admin while the first remains = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Deleting it too, leaving admin alone again, still cannot touch its own
+	// role or disabled state - the regression check this test exists for.
+	if rec := h.do(http.MethodDelete, "/api/v1/users/"+itoa(deputy.ID), nil, withCookie(sid)); rec.Code != http.StatusOK {
+		t.Fatalf("delete the disabled second admin = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := h.do(http.MethodPatch, "/api/v1/users/"+itoa(adminID),
+		map[string]any{"role": "user"}, withCookie(sid)); rec.Code != http.StatusBadRequest {
+		t.Errorf("self-demote as the only admin (again) = %d, want 400", rec.Code)
 	}
 }

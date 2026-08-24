@@ -411,10 +411,15 @@ automatically when either is set.
 | not a member | not a member | refused, `ErrNotAuthorized`, no account created |
 
 The role is re-evaluated on every sign-in, so a directory change promotes or
-demotes. Two exceptions: an account with the `restricted` role is never
-rewritten, and an administrator who still has a local password is never demoted
-- that is the break-glass account, and losing it when the directory is what
-broke is the failure this whole feature has to survive.
+demotes. Three exceptions: an account with the `restricted` role is never
+rewritten; an administrator who still has a local password is never demoted -
+that is the break-glass account, and losing it when the directory is what
+broke is the failure this whole feature has to survive; and a demotion that
+would leave the server with no enabled administrator at all is held back
+regardless of whether this one has a password, generalizing the same
+reasoning to a pure-SSO sole administrator. The sign-in itself still succeeds
+in every held-back case - only the role write is skipped, and a warning is
+logged so a directory/application mismatch is visible rather than silent.
 
 Libraries (admin for writes)
 - `GET /libraries`; `POST /libraries` `{name, kind, paths:[]}`; `PATCH /libraries/{id}`; `DELETE /libraries/{id}`
@@ -445,6 +450,15 @@ Items
   client adds the durations of the preceding `files[]` (ordered by `seq`) to
   get an absolute position. `files[].duration_ms` is always populated.
 - `PATCH /items/{id}` (admin) metadata edits
+- `DELETE /items/{id}` (admin) removes the item: its file(s) on disk first,
+  then the catalog record, so a database-only delete can never be resurrected
+  by the next scan. Every path is re-validated against the configured library
+  roots before anything is unlinked, and only the item's own file paths are
+  ever removed - never a directory, so a book folder left empty by the delete
+  is left in place rather than recursed into. A file already missing is not an
+  error; a disk error that is not "missing" aborts before the catalog row is
+  touched, so the item never disappears from view while its files silently
+  survive.
 - `GET /items/{id}/cover?size=thumb|full` (image, long cache, ETag)
 - `GET /items/{id}/epub` reading manifest:
   `{item_id, title, language, resource_url, container_url, cover_url?, spine:[{href,url,size}], progress}`.
@@ -486,7 +500,51 @@ Admin
   with the role already folded in, so the frontend never reimplements the rule.
   `GET .../libraries` answers `{user_id, libraries:[id]}`, the same shape `PUT`
   returns after a write - it is what the admin page reads to draw a user's
-  library picker in its current state.
+  library picker in its current state. `PATCH` also takes `display_name`,
+  `username`, and `password` (an admin-initiated reset - the new value
+  replaces the stored hash, same as `SetPassword`). `DELETE` refuses an
+  administrator's own account and the last enabled administrator; deleting
+  anyone else cascades their sessions, api tokens, library grants, settings,
+  progress, bookmarks, collections and import jobs with the row (every
+  `user_id` foreign key is `ON DELETE CASCADE`).
+
+  **Username rename.** An account already linked to an OIDC subject renames
+  freely - every lookup after its first sign-in goes by that subject, never
+  by username again, so the change is purely cosmetic. An account that has
+  not linked yet is a different story while single sign-on is configured at
+  all: its current username is exactly what a first sign-in matches a
+  pre-created account by (see "OIDC group mapping" above), so `PATCH` refuses
+  the rename there (`400`) rather than let it silently break that match for
+  whoever is still waiting to sign in as this account. With single sign-on
+  off entirely, nothing protects against that hazard because nothing depends
+  on username adoption, so rename is unrestricted. Either way, the collision
+  check folds case the same way every other username lookup in this package
+  does (`lower(username) = lower(?)`), so a rename can never create a
+  same-username-different-case pair the schema's own `UNIQUE` (case-sensitive)
+  constraint would let through but every actual lookup would find ambiguous.
+  `GET /users` and `GET .../libraries`'s enclosing user object answer
+  `oidc_linked` (derived from `oidc_subject`, not the subject itself) so the
+  admin page can grey the field on an unbound account instead of letting the
+  rename click come back refused.
+
+  **Lockout guards.** Beyond `DELETE`'s guard above, `PATCH` refuses a role
+  change away from `admin` or `disabled: true` on an administrator's own
+  account unconditionally, and on any account that is currently the last
+  enabled administrator (`AdminCount() <= 1`) - covering both "you demote
+  yourself" and "you demote the only other admin while somehow no longer
+  counting as one yourself," the latter being unreachable in practice since
+  every caller here must itself be an enabled administrator, but checked
+  anyway as the same defense-in-depth the delete guard already is. The one
+  vector this class of guard cannot reach - because it never goes through
+  this handler - is OIDC's live role re-evaluation on every sign-in
+  (`userForSubject`, `shouldApplyRole`): a directory that revokes a pure-SSO
+  administrator's group membership would otherwise demote the last enabled
+  administrator on their very next sign-in, with no admin session involved to
+  refuse it. That path carries its own equivalent check - the sign-in still
+  succeeds, but the demotion half of "re-evaluated on every sign-in" is held
+  back and a warning is logged - generalizing `shouldApplyRole`'s existing
+  break-glass exception for the password administrator to "no other
+  administrator exists either."
 - `GET /system/status` -> `{version, go_version, db_path, db_size_bytes, data_dir,
   counts:{ebooks,audiobooks}, libraries, users, last_scans, oidc_enabled,
   local_login, settings_updated_at, base_url, time}`
@@ -572,7 +630,7 @@ scaling still compounds on top of it.
 | Settings at rest | the OIDC client secret is ciphertext in the row, never returned by the API, and a wrong key fails loudly rather than reading as unset |
 | Setup gate | every `/api/v1` route except the wizard and the public probes answers 403 until setup completes; the 401 check still runs first |
 | Settings authorization | `GET`/`PUT /admin/settings` and the OIDC test are admin-only; a plain user gets 403, an anonymous caller 401 |
-| Lockout | the password form cannot be turned off while OIDC is off, nor while no administrator could sign in through it; `GOBOOKSHELF_ADMIN_RECOVERY` is environment-only |
+| Lockout | the password form cannot be turned off while OIDC is off, nor while no administrator could sign in through it; `GOBOOKSHELF_ADMIN_RECOVERY` is environment-only; an administrator cannot delete or demote their own account, nor delete the last enabled administrator |
 | SSO group mapping | an identity in neither configured group is refused and creates no account |
 | Setup token | spendable exactly once even under concurrent requests, so the wizard can only ever create one administrator; a rejected account hands the token back |
 | Upload permission | a plain user without `can_upload`, and a `restricted` account with it set, are both refused on upload and import; the flag grants both; withdrawing it takes effect on the next request; `/auth/me` agrees with what the endpoints do |
@@ -582,6 +640,7 @@ scaling still compounds on top of it.
 | Upload rate limit | uploads are limited per account, and only one is accepted at a time from one account |
 | Import SSRF | a URL import refuses loopback, private, link-local and carrier-grade-NAT addresses and any non-http(s) scheme before a job is queued, and never echoes the address back; a chapter walk never leaves the starting host |
 | Cross-library upload | uploading or importing into a library the caller cannot see answers 404 and writes nothing into it |
+| Item deletion | admin only (401/403 like every other admin route); deletes the file(s) on disk and the catalog record; a file already gone by hand still succeeds; a rescan afterward does not resurrect the item |
 
 ## Milestones
 

@@ -12,6 +12,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/oauth2"
 )
 
@@ -203,10 +204,30 @@ func (m *Manager) userForSubject(ctx context.Context, client *oidcClient, subjec
 	u, err := scanUser(row)
 	if err == nil {
 		if client.shouldApplyRole(u, role) {
-			if err := m.SetRole(ctx, u.ID, role); err != nil {
-				return nil, err
+			// A demotion this sign-in would otherwise apply is held back if
+			// it is the last enabled administrator: the same reasoning as
+			// shouldApplyRole's break-glass exception for the password
+			// admin, generalized to "there is no other administrator either."
+			// Only the demotion half is held back - a promotion never needs
+			// this check, and the sign-in itself still succeeds either way.
+			demoting := u.Role == RoleAdmin && role != RoleAdmin
+			blocked := false
+			if demoting {
+				n, err := m.AdminCount(ctx)
+				if err != nil {
+					return nil, err
+				}
+				blocked = n <= 1
 			}
-			u.Role = role
+			if blocked {
+				log.Warn().Int64("user", u.ID).Str("directory_role", role).
+					Msg("refusing to demote the last enabled administrator on sign-in; promote another account first")
+			} else {
+				if err := m.SetRole(ctx, u.ID, role); err != nil {
+					return nil, err
+				}
+				u.Role = role
+			}
 		}
 		return u, nil
 	}

@@ -295,3 +295,85 @@ func TestTokenScopesDefaultToRead(t *testing.T) {
 		t.Fatalf("tokens = %d", len(list))
 	}
 }
+
+// AdminCount only counts enabled administrators: a disabled one, or a
+// demoted one, must not read as "still available" to whatever is deciding
+// whether deleting an account would leave the server with none.
+func TestAdminCount(t *testing.T) {
+	mgr, _, ctx := newManager(t)
+
+	first, err := mgr.CreateUser(ctx, "admin", "correct-horse-battery", "Admin", auth.RoleAdmin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := mgr.AdminCount(ctx); err != nil || n != 1 {
+		t.Fatalf("AdminCount with one admin = %d, %v", n, err)
+	}
+
+	second, err := mgr.CreateUser(ctx, "deputy", "correct-horse-battery", "Deputy", auth.RoleAdmin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := mgr.AdminCount(ctx); err != nil || n != 2 {
+		t.Fatalf("AdminCount with two admins = %d, %v", n, err)
+	}
+
+	if err := mgr.SetDisabled(ctx, second.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := mgr.AdminCount(ctx); err != nil || n != 1 {
+		t.Fatalf("AdminCount after disabling one = %d, %v, want 1 (disabled admins do not count)", n, err)
+	}
+
+	if err := mgr.SetRole(ctx, first.ID, auth.RoleUser); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := mgr.AdminCount(ctx); err != nil || n != 0 {
+		t.Fatalf("AdminCount after demoting the last one = %d, %v, want 0", n, err)
+	}
+}
+
+// SetUsername renames a local account, case-insensitively guarding against a
+// collision the same way every other username lookup in this package folds
+// case (lower(username) = lower(?)).
+func TestSetUsernameRenameAndCollision(t *testing.T) {
+	mgr, _, ctx := newManager(t)
+
+	alice, err := mgr.CreateUser(ctx, "alice", "correct-horse-battery", "Alice", auth.RoleUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.CreateUser(ctx, "bob", "correct-horse-battery", "Bob", auth.RoleUser); err != nil {
+		t.Fatal(err)
+	}
+
+	// The happy path: OIDC is not configured, so nothing protects the rename.
+	if err := mgr.SetUsername(ctx, alice.ID, "alicia"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	renamed, err := mgr.UserByID(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.Username != "alicia" {
+		t.Errorf("username after rename = %q", renamed.Username)
+	}
+
+	// A collision with an existing account, differing only in case, is
+	// refused: every lookup elsewhere folds case, so two accounts differing
+	// only in case would make that lookup ambiguous.
+	if err := mgr.SetUsername(ctx, alice.ID, "BOB"); !errors.Is(err, auth.ErrUsernameTaken) {
+		t.Fatalf("rename onto an existing username (different case) = %v, want ErrUsernameTaken", err)
+	}
+
+	// Renaming onto its own current name, in a different case, is not a
+	// collision with itself.
+	if err := mgr.SetUsername(ctx, alice.ID, "ALICIA"); err != nil {
+		t.Fatalf("case-only rename of the same account: %v", err)
+	}
+
+	// The account still authenticates under its new name.
+	if _, _, err := mgr.Login(ctx, "alicia", "correct-horse-battery", "test", "127.0.0.1"); err != nil {
+		t.Fatalf("login with the renamed username: %v", err)
+	}
+}

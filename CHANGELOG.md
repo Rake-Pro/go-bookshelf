@@ -48,6 +48,72 @@ All notable changes to this project are recorded here. The format follows
     anything) and the `import_jobs` table.
   - Uploads are rate limited per account and limited to one in flight per
     account, so the 2 GiB cap cannot be multiplied by parallel requests.
+- **Admin-only book removal.** `DELETE /api/v1/items/{id}` removes an item's
+  file(s) from disk and its catalog record together, so a deletion cannot be
+  quietly undone by the next scan. Every path is re-validated against the
+  configured library roots before anything is unlinked, only the item's own
+  files are ever removed (never a directory), and a file already missing by
+  hand is tolerated - a disk error that is not "missing" aborts before the
+  catalog row is touched. A Delete control on the item page, visible only to
+  administrators, confirms the title before acting.
+- **Richer user editing in Admin -> Users.** Each account now has an Edit
+  disclosure for its display name, username, admin-initiated password reset,
+  role and disabled state (all through the existing `PATCH /users/{id}`), and
+  a Delete control. Deleting a user cascades everything it owns - sessions,
+  api tokens, library grants, settings, progress, bookmarks, collections,
+  import jobs - since every `user_id` foreign key in the schema is
+  `ON DELETE CASCADE`. Every control that could lock every administrator out
+  of the server - delete, role away from admin, disable - is greyed out
+  rather than accept-then-error on your own account and on whichever account
+  is currently the last enabled administrator; the server refuses all three
+  regardless.
+- **Username rename.** An account already linked to an OIDC subject renames
+  freely - lookups after the first sign-in go by that subject, never by
+  username again, so it is purely cosmetic. An account that has not linked
+  yet is refused (`400`) while single sign-on is configured at all: its
+  current username is exactly what a first sign-in matches a pre-created
+  account by, and renaming it would silently break that match for whoever is
+  still waiting to sign in as it. The collision check is case-insensitive
+  (`lower(username) = lower(?)`, the same fold every other lookup already
+  uses), closing the gap where the column's own `UNIQUE` constraint is
+  case-sensitive but nothing that reads it is. `GET /users` now answers
+  `oidc_linked` (derived from `oidc_subject`, never the value itself) so the
+  admin page can grey the field instead of letting the rename come back
+  refused.
+- **Service worker update flow.** A new deploy no longer needs a double
+  refresh or an incognito window to show up. The worker installs and precaches
+  in the background but never takes over on its own; once one is waiting, a
+  small banner ("Update available - Refresh") offers to hand it control. The
+  worker still `clients.claim()`s on activate and drops every cache but its
+  own, and the page reloads exactly once, only after the new worker actually
+  takes over - never mid-session, so an audiobook playing in the mini-player
+  is never interrupted by a background deploy.
+- **Password sign-in gated off, correctly reflected in the admin UI.** The
+  `oidc.local_login_enabled` setting, its validation (refused while OIDC is
+  off, so there is always a way in) and `GOBOOKSHELF_ADMIN_RECOVERY`'s
+  override were already there; what was missing is that the Edit disclosure
+  and the Add user form built this batch never checked it. Both now compose
+  the same effective value the login page and `/auth/status` already do, and
+  when it is off the password field is left out entirely - no greyed input,
+  no reserved space - following the login page's own precedent of hiding the
+  password form rather than disabling it: the capability is off for the
+  whole deployment, not a per-account exception, so there is nothing to grey.
+  An account is still created by username alone in that state, for single
+  sign-on to adopt on its first login.
+- **Closed the remaining ways to end up with zero enabled administrators.**
+  `PATCH /users/{id}` already refused a self-demotion and a self-disable
+  unconditionally; it now also refuses a role change away from `admin` or
+  `disabled: true` on whichever account is currently the last enabled
+  administrator, whoever the caller is. The one vector that guard cannot
+  reach - because it does not go through this handler - is OIDC's live role
+  re-evaluation on every sign-in: a directory that revokes a pure-SSO
+  administrator's group membership, with no local password to trigger the
+  existing break-glass exception, would otherwise demote the last enabled
+  administrator on their very next sign-in. That path now holds the
+  demotion back the same way (sign-in still succeeds; a warning is logged)
+  rather than silently locking the server's own administration out from
+  under it. The admin page greys role and disabled on your own row and on
+  the last-admin row accordingly.
 ### Changed
 - **Reader layout.** The page now fills the viewport. The top bar and the footer
   float over the text, hide themselves two seconds after the book opens and on
