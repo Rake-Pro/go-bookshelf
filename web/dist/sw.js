@@ -19,7 +19,7 @@
  * reloads.
  */
 
-const VERSION = 'v6';
+const VERSION = 'v7';
 const SHELL_CACHE = `bookshelf-shell-${VERSION}`;
 const COVER_CACHE = `bookshelf-covers-${VERSION}`;
 const MAX_COVERS = 400;

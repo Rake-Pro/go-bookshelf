@@ -4,6 +4,11 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/* The [hidden] attribute must always win. Author display rules (e.g.
+   .formerror's flex) otherwise override the UA's [hidden]{display:none} and
+   "hidden" boxes render as empty strips - seen live on the login error box. */
+[hidden] { display: none !important; }
+
 html { -webkit-text-size-adjust: 100%; }
 
 body {
