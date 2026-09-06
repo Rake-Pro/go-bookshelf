@@ -26,7 +26,7 @@ import (
 
 	"github.com/rake-pro/go-bookshelf/internal/settings"
 	"github.com/rake-pro/go-bookshelf/internal/store"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // devInsecureSeed derives the fixed key used when GOBOOKSHELF_DEV_INSECURE_KEY
