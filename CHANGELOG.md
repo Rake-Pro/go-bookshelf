@@ -121,6 +121,7 @@ All notable changes to this project are recorded here. The format follows
   under it. The admin page greys role and disabled on your own row and on
   the last-admin row accordingly.
 ### Changed
+- CI: release flow renamed from `main -> prod` to `dev -> main`. `dev` is the default working branch, `main` the protected release branch; the bot PR is now "Merge dev to main". Mechanics unchanged. Pushes to `dev` now also publish `:dev` and `:dev-<sha>` images.
 - **Reader layout.** The page now fills the viewport. The top bar and the footer
   float over the text, hide themselves two seconds after the book opens and on
   every page turn, and come back on a tap in the center of the page, on any key,
