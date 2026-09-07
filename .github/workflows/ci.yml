@@ -80,6 +80,18 @@ jobs:
           PGPASSWORD=postgres psql -h localhost -U postgres -c 'CREATE DATABASE bookshelf_smoke'
           ./scripts/smoke.sh --driver postgres
 
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
   build:
     permissions:
       contents: read
