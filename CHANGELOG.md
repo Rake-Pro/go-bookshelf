@@ -17,7 +17,7 @@ All notable changes to this project are recorded here. The format follows
   shows each non-admin user's library grants as a checkbox list (backed by the
   new `GET /api/v1/users/{id}/libraries`; saving uses the existing PUT).
   Library visibility has always been a deny-by-default whitelist for
-  non-admins, but no UI existed to grant access - newly provisioned users
+  non-admins, but no UI existed to grant access: newly provisioned users
   (including OIDC) saw empty libraries until now. Admin users show a static
   "All libraries (admin)" note instead of a control.
 - **Adding books from the browser.** An "Add books" button on the library and
@@ -28,7 +28,7 @@ All notable changes to this project are recorded here. The format follows
     audio file) applied while streaming, an extension allowlist that follows the
     library's kind, a magic-byte check for each format, and finally a parse by
     the same reader the scanner uses. Uploads are staged in a hidden directory
-    inside the library root - which the scanner skips - and renamed into place
+    inside the library root (which the scanner skips), and renamed into place
     only once they pass, so a rejected file leaves the library untouched. The
     name on disk is derived from the book's own metadata
     (`<Author> - <Title>.epub`, or a numbered directory for an audiobook), never
@@ -44,7 +44,7 @@ All notable changes to this project are recorded here. The format follows
     an element and attribute allowlist with scripts, styles, forms, navigation,
     footers and ad blocks removed, images re-fetched through the guard and
     embedded, `rel="next"` and "next chapter" links followed on the same host at
-    one request a second, and the result built into an EPUB 3 - which is then
+    one request a second, and the result built into an EPUB 3, which is then
     validated like any other upload. Per-site adapters can be added by
     implementing `importer.Site` without touching the pipeline.
   - **A new `can_upload` permission**, per account, with a toggle on the admin
@@ -59,22 +59,22 @@ All notable changes to this project are recorded here. The format follows
   quietly undone by the next scan. Every path is re-validated against the
   configured library roots before anything is unlinked, only the item's own
   files are ever removed (never a directory), and a file already missing by
-  hand is tolerated - a disk error that is not "missing" aborts before the
+  hand is tolerated; a disk error that is not "missing" aborts before the
   catalog row is touched. A Delete control on the item page, visible only to
   administrators, confirms the title before acting.
 - **Richer user editing in Admin -> Users.** Each account now has an Edit
   disclosure for its display name, username, admin-initiated password reset,
   role and disabled state (all through the existing `PATCH /users/{id}`), and
-  a Delete control. Deleting a user cascades everything it owns - sessions,
+  a Delete control. Deleting a user cascades everything it owns (sessions,
   api tokens, library grants, settings, progress, bookmarks, collections,
-  import jobs - since every `user_id` foreign key in the schema is
+  import jobs), since every `user_id` foreign key in the schema is
   `ON DELETE CASCADE`. Every control that could lock every administrator out
-  of the server - delete, role away from admin, disable - is greyed out
+  of the server (delete, role away from admin, disable) is greyed out
   rather than accept-then-error on your own account and on whichever account
   is currently the last enabled administrator; the server refuses all three
   regardless.
 - **Username rename.** An account already linked to an OIDC subject renames
-  freely - lookups after the first sign-in go by that subject, never by
+  freely: lookups after the first sign-in go by that subject, never by
   username again, so it is purely cosmetic. An account that has not linked
   yet is refused (`400`) while single sign-on is configured at all: its
   current username is exactly what a first sign-in matches a pre-created
@@ -89,19 +89,19 @@ All notable changes to this project are recorded here. The format follows
 - **Service worker update flow.** A new deploy no longer needs a double
   refresh or an incognito window to show up. The worker installs and precaches
   in the background but never takes over on its own; once one is waiting, a
-  small banner ("Update available - Refresh") offers to hand it control. The
-  worker still `clients.claim()`s on activate and drops every cache but its
-  own, and the page reloads exactly once, only after the new worker actually
-  takes over - never mid-session, so an audiobook playing in the mini-player
-  is never interrupted by a background deploy.
+  small banner ("Update available", with a "Refresh" button) offers to hand it
+  control. The worker still `clients.claim()`s on activate and drops every
+  cache but its own, and the page reloads exactly once, only after the new
+  worker actually takes over, never mid-session, so an audiobook playing in
+  the mini-player is never interrupted by a background deploy.
 - **Password sign-in gated off, correctly reflected in the admin UI.** The
   `oidc.local_login_enabled` setting, its validation (refused while OIDC is
   off, so there is always a way in) and `GOBOOKSHELF_ADMIN_RECOVERY`'s
   override were already there; what was missing is that the Edit disclosure
   and the Add user form built this batch never checked it. Both now compose
   the same effective value the login page and `/auth/status` already do, and
-  when it is off the password field is left out entirely - no greyed input,
-  no reserved space - following the login page's own precedent of hiding the
+  when it is off the password field is left out entirely (no greyed input,
+  no reserved space), following the login page's own precedent of hiding the
   password form rather than disabling it: the capability is off for the
   whole deployment, not a per-account exception, so there is nothing to grey.
   An account is still created by username alone in that state, for single
@@ -111,7 +111,7 @@ All notable changes to this project are recorded here. The format follows
   unconditionally; it now also refuses a role change away from `admin` or
   `disabled: true` on whichever account is currently the last enabled
   administrator, whoever the caller is. The one vector that guard cannot
-  reach - because it does not go through this handler - is OIDC's live role
+  reach, because it does not go through this handler, is OIDC's live role
   re-evaluation on every sign-in: a directory that revokes a pure-SSO
   administrator's group membership, with no local password to trigger the
   existing break-glass exception, would otherwise demote the last enabled
@@ -125,7 +125,7 @@ All notable changes to this project are recorded here. The format follows
 - **Reader layout.** The page now fills the viewport. The top bar and the footer
   float over the text, hide themselves two seconds after the book opens and on
   every page turn, and come back on a tap in the center of the page, on any key,
-  or as soon as focus enters them - they stay in the document, `inert` and
+  or as soon as focus enters them; they stay in the document, `inert` and
   hidden, so keyboard and screen-reader users never lose them. The column
   measure follows the reading size (~38em per column) instead of a fixed value,
   a second column appears only on a landscape viewport at least 1100px wide, and
@@ -133,7 +133,7 @@ All notable changes to this project are recorded here. The format follows
   setting. A cover, title page or part divider is laid out as one centered page
   rather than stranded in the left half of an empty spread.
 - **Reader themes.** Paper, Sepia, Gray, Night, high-contrast light and dark,
-  and Custom - each with its own link and selection colors. The theme is applied
+  and Custom, each with its own link and selection colors. The theme is applied
   to the reader's own chrome and sheets as well as to the page, so a dark page
   no longer sits in a light frame, and `<meta name="theme-color">` follows it
   while a book is open.
@@ -196,14 +196,14 @@ All notable changes to this project are recorded here. The format follows
   `GOBOOKSHELF_DB_DSN` runs the whole application on Postgres instead of SQLite;
   SQLite stays the default and is unchanged. The schema is shipped per dialect
   under `internal/store/migrations/{sqlite,postgres}/` and migrates on startup
-  either way. The DSN may carry a password, so it is only ever logged - and only
-  ever reported on the admin page - with the password replaced.
+  either way. The DSN may carry a password, so it is only ever logged, and only
+  ever reported on the admin page, with the password replaced.
 - **Cover images are stored in the database**, as two bounded JPEGs per book: a
   thumbnail at most 400px on its longest side and a full render at most 1600px.
   `GET /api/v1/items/{id}/cover` serves them with the same caching headers as
   before.
-- `GOBOOKSHELF_TEST_POSTGRES_DSN` re-runs the entire test suite - the API and
-  frontend contract tests included - against a real Postgres, and CI does so in
+- `GOBOOKSHELF_TEST_POSTGRES_DSN` re-runs the entire test suite (the API and
+  frontend contract tests included) against a real Postgres, and CI does so in
   a `postgres:17` job. `scripts/smoke.sh --driver postgres` drives the built
   binary against one with no data directory at all.
 - First-run wizard at `/setup`: the one-time token, the administrator account,
@@ -215,7 +215,7 @@ All notable changes to this project are recorded here. The format follows
 - `GET|PUT /api/v1/admin/settings` and `POST /api/v1/admin/settings/oidc/test`.
 - Single sign-on group mapping for both roles: an **admin group** grants the
   administrator role, and a **user group**, when set, is the requirement for
-  signing in at all - an identity in neither is refused and no account is
+  signing in at all: an identity in neither is refused and no account is
   created for it. Roles are re-evaluated on every sign-in, except for
   `restricted` accounts and for an administrator who still has a local password,
   which are never rewritten.
@@ -260,7 +260,7 @@ All notable changes to this project are recorded here. The format follows
   YAML key, is gone; an unknown key in the config file is now refused rather
   than ignored.
 - **Breaking: `POST /api/v1/auth/setup` is replaced by
-  `POST /api/v1/setup/{step}`** - `token`, `admin`, `base-url`, `oidc`,
+  `POST /api/v1/setup/{step}`**: `token`, `admin`, `base-url`, `oidc`,
   `library`, `complete`.
 - Until first-run setup is complete, every `/api/v1` route other than the wizard
   and the public probes answers `403 setup_required`.
@@ -269,7 +269,7 @@ All notable changes to this project are recorded here. The format follows
 `GOBOOKSHELF_SECRETS_KEY` to 32 base64 bytes (`openssl rand -base64 32`) and
 drop the variables that are gone. A database that
 already has accounts starts with setup marked complete, so no wizard appears and
-nothing is gated - but the OIDC settings do not migrate: re-enter the issuer,
+nothing is gated, but the OIDC settings do not migrate: re-enter the issuer,
 client id, client secret and group names at **Admin -> Settings**. Until you do,
 sign-in is password-only. If single sign-on locks you out, restart with
 `GOBOOKSHELF_ADMIN_RECOVERY=true`.

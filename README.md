@@ -13,7 +13,7 @@ screen-reader markup. See [Accessibility](#accessibility).
 
 - **One binary, one file.** Pure-Go SQLite (no CGO), embedded frontend, no
   external services or transcoder. With Postgres it needs no local disk at all
-  and can run on any node - see [Database](#database).
+  and can run on any node (see [Database](#database)).
 - **Reads embedded metadata.** EPUB from `container.xml` and the OPF package;
   MP3 from ID3v2 (2.2-2.4) with durations from MPEG frame headers (including
   Xing/VBRI); M4B/M4A from the MP4 box tree (`ilst` tags, freeform atoms,
@@ -27,7 +27,7 @@ screen-reader markup. See [Accessibility](#accessibility).
   are kept another thirty in case the share comes back.
 - **Per-user state that follows you.** Progress, bookmarks, reader typography
   and player preferences are stored server-side per account.
-- **Add books from the browser.** Upload files, or paste a URL - a book file,
+- **Add books from the browser.** Upload files, or paste a URL: a book file,
   or a web story the server cleans up and builds into an EPUB. Everything is
   validated by the scanner's own parser before touching a library. See
   [Adding books](#adding-books).
@@ -48,7 +48,7 @@ screen-reader markup. See [Accessibility](#accessibility).
 
 ## Quick start
 
-Generate the key that encrypts stored credentials - there is no default and
+Generate the key that encrypts stored credentials; there is no default and
 the server will not start without it:
 
 ```
@@ -71,12 +71,12 @@ docker logs go-bookshelf | grep 'one-time token'
 ```
 
 Open `http://localhost:8080/setup` and paste it. The wizard covers the admin
-account, the base URL, optional single sign-on, and your first library - point
+account, the base URL, optional single sign-on, and your first library: point
 it at `/books`. Everything is stored in the database and editable later at
 **Admin -> Settings**.
 
 The read-only media mount is deliberate: go-bookshelf never writes to your
-library. Everything it generates - catalog, covers - lives in the database, by
+library. Everything it generates (catalog, covers) lives in the database, by
 default the SQLite file in `/data`.
 
 ### Environment
@@ -105,7 +105,7 @@ in a file beside the database it decrypts.
 
 Two backends, same schema, same behaviour; migrations run at startup.
 
-**SQLite** (default): pure Go, no server, one file - right for a single box.
+**SQLite** (default): pure Go, no server, one file, right for a single box.
 
 **Postgres**: for more than one machine, or a scheduler that moves the
 process. Set `GOBOOKSHELF_DB_DSN`; leave `GOBOOKSHELF_DB_PATH` and
@@ -126,22 +126,22 @@ docker run -d --name go-bookshelf \
 With Postgres the container needs **no writable volume**: catalog, users,
 sessions, API tokens, reading positions, bookmarks, settings, the setup token,
 scan history and cover images all live in the database, and media is
-read-only - which is what allows rescheduling onto any node.
+read-only, which is what allows rescheduling onto any node.
 
 `GOBOOKSHELF_DATA_DIR` works with either backend and is only a cache: covers
 are written to it after being read from the database, and deleting it costs
 one re-read. The DSN may carry a password, so it is logged and displayed only
 with the password redacted.
 
-Covers are stored as two bounded JPEGs per book - a thumbnail at most 400px on
-the longest side, a full render at most 1600px - produced once at scan time.
+Covers are stored as two bounded JPEGs per book (a thumbnail at most 400px on
+the longest side, a full render at most 1600px), produced once at scan time.
 
 Backups: copy the SQLite file, or `pg_dump` the Postgres database. There is no
 in-app backup.
 
-**Everything else is configured in the app** - base URL, cookie and session
+**Everything else is configured in the app**: base URL, cookie and session
 behaviour, scan interval, SSO, reverse-proxy auth, the metadata provider, the
-`/metrics` allow list, and libraries - at **Admin -> Settings**, applied to
+`/metrics` allow list, and libraries, at **Admin -> Settings**, applied to
 the running server without a restart.
 
 If the secrets key is lost, the stored OIDC client secret cannot be decrypted
@@ -153,7 +153,7 @@ re-enter the credentials at Admin -> Settings.
 
 **Ebooks.** One `.epub` is one item. Title, subtitle, creators with roles,
 language, identifiers, publisher, date, description, subjects and series come
-from the OPF - series via the EPUB 3 `belongs-to-collection` property and the
+from the OPF, series via the EPUB 3 `belongs-to-collection` property and the
 older `<meta name="...series">` convention. The cover is the OPF cover image,
 falling back to the first manifest image. A `metadata.opf` next to the file
 replaces the embedded metadata.
@@ -222,7 +222,7 @@ A. Writer - The Long Night/02 - Part Two.mp3
 
 folded to ASCII, stripped of filesystem-reserved characters, length-capped,
 suffixed `(2)`, `(3)` on collision. One plain subfolder may be named to file
-into - a name, not a path. A byte-identical re-upload answers with a link to
+into: a name, not a path. A byte-identical re-upload answers with a link to
 the existing copy.
 
 **Importing from a URL.** The server fetches in the background; the sheet
@@ -235,7 +235,7 @@ not the extension or the remote server's claims:
   (scripts, styles, forms, navigation, footers, share bars, comments and ads
   stripped; headings, paragraphs, lists and images kept), images re-fetched
   and embedded, "next chapter" links followed (same site only, one request a
-  second), and the result built into an EPUB - then validated like any upload.
+  second), and the result built into an EPUB, then validated like any upload.
 
 The importer does not run JavaScript (client-rendered pages yield nothing),
 does not sign in (no paywalls), uses a generic extractor that will sometimes
@@ -253,13 +253,13 @@ endpoints answers `403 setup_required`.
 
 The wizard, at `/setup`:
 
-1. **Token** - checked here, not spent, so a typo fails early.
-2. **Administrator** - username, display name, password; the token is spent
+1. **Token**: checked here, not spent, so a typo fails early.
+2. **Administrator**: username, display name, password; the token is spent
    and the account signed in.
-3. **Base URL** - prefilled from `X-Forwarded-Proto`/`X-Forwarded-Host` or the
+3. **Base URL**: prefilled from `X-Forwarded-Proto`/`X-Forwarded-Host` or the
    address you opened.
-4. **Single sign-on** - optional; **Test** runs discovery without saving.
-5. **First library** - name, kind, an existing readable path. Skippable.
+4. **Single sign-on**: optional; **Test** runs discovery without saving.
+5. **First library**: name, kind, an existing readable path. Skippable.
 6. **Done.**
 
 `/setup/token`, `/setup/admin` and `/auth/login` are rate limited per source
@@ -279,7 +279,7 @@ settings page shows verbatim:
 <your base URL>/api/v1/auth/oidc/callback
 ```
 
-Saving runs discovery first - a provider that does not answer fails the save
+Saving runs discovery first: a provider that does not answer fails the save
 now rather than at the next sign-in. The issuer is stored exactly as typed,
 trailing slash included, because that is what the token's `iss` claim is
 compared against.
@@ -287,15 +287,15 @@ compared against.
 **Group mapping.** Two optional group names, matched against the **Groups
 claim** (`groups` by default):
 
-- **Admin group** - members get the administrator role.
-- **User group** - when set, only members of either group may sign in; anyone
+- **Admin group**: members get the administrator role.
+- **User group**: when set, only members of either group may sign in; anyone
   else is refused and no account is created. Left empty, any authenticated
   identity signs in as an ordinary user.
 
 The role is re-evaluated on every sign-in, so directory changes promote and
 demote here too. Two accounts are never touched: `restricted` ones (a local
-decision) and an administrator who still has a local password - the
-break-glass account.
+decision) and an administrator who still has a local password (the
+break-glass account).
 
 An account is matched on OIDC subject first, then adopted by username, so you
 can pre-create an account and grant library access before its first sign-in.
@@ -341,7 +341,7 @@ form returns while the variable is set. Deliberately not settable in-app.
 - **Motion.** `prefers-reduced-motion` disables every transition and
   animation.
 - **Keyboard.** Everything is operable by keyboard, including the reader
-  (paging, contents, settings, jump to start/end) and the player - with key
+  (paging, contents, settings, jump to start/end) and the player, with key
   handling attached inside the book frame, where events do not reach the host
   document. Focus is visible everywhere, a skip link leads to the main region,
   and modal sheets use `<dialog>` for focus trapping.
@@ -415,9 +415,9 @@ make docker    # multi-stage container build
 make all       # fmt-check, vet, checkweb, test, build
 ```
 
-`make smoke` drives the same journey the web app performs - setup, login,
+`make smoke` drives the same journey the web app performs (setup, login,
 library, scan, home, item detail, EPUB manifest and resources, ranged audio,
-progress, settings, bookmarks, OPDS, logout - so a backend change that breaks
+progress, settings, bookmarks, OPDS, logout), so a backend change that breaks
 a view fails the build. The same journey runs as a Go test in
 `internal/api/frontend_test.go`.
 
