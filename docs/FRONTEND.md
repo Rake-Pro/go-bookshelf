@@ -120,7 +120,7 @@ All color, spacing, radius and font values are CSS custom properties in
   `--accent`, ...) at them so its bars and sheets match the page. The same
   colors exist once more as literals in `app/epub.js` (`READER_PALETTES`),
   because the stylesheet injected into the book iframe cannot read the host
-  document's variables - change both together.
+  document's variables; change both together.
 - **Reduced motion**: a global `prefers-reduced-motion` block disables every
   transition and animation.
 - `<meta name="theme-color">` is rewritten whenever the theme resolves.
@@ -236,7 +236,7 @@ status line under each card is an `aria-live="polite"` region.
 | `GET /authors/{id}` | `{author:{id, name, item_count}, items:[Item], total}` |
 | `GET /series?limit=` | `{items:[{id, name, item_count?}], total}` |
 | `GET /series/{id}` | `{series:{id, name, item_count}, items:[Item], total}`; each item's position is its own `series.sequence` |
-| `GET /search?q=` | `{query, items:{items,total}, authors:{items,total}, series:{items,total}}` - one list envelope per group |
+| `GET /search?q=` | `{query, items:{items,total}, authors:{items,total}, series:{items,total}}`: one list envelope per group |
 | `GET /items/{id}/cover?size=thumb\|full` | image bytes |
 | `GET /items/{id}/download` | file or zip, opened as a plain link |
 | `GET /items/{id}/files/{file_id}/stream` | audio with Range support |
@@ -333,7 +333,7 @@ Notes for the backend:
 | `DELETE /users/{id}` | `{status:"deleted"}`; 400 on your own account or the last administrator |
 | `GET /users/{id}/libraries` | `{user_id, libraries:[id]}` |
 | `PUT /users/{id}/libraries` | `{libraries:[id]}` |
-| `GET /system/status` | `{version, db_driver, db_dsn (redacted), db_size_bytes (0 on Postgres), counts:{ebooks, audiobooks}, libraries, users, last_scans, oidc_enabled, local_login, settings_updated_at, base_url, ...}` |
+| `GET /system/status` | `{version, db_driver, db_path, db_dsn (redacted), db_size_bytes, counts:{ebooks, audiobooks}, libraries, users, last_scans, oidc_enabled, local_login, settings_updated_at, base_url, ...}`. `db_size_bytes` is the SQLite file size, or `pg_database_size` of the connected database on Postgres. |
 
 The scan button polls `GET /libraries/{id}/scans` every 2 s for up to 2 minutes
 and reads the newest entry; a row with `finished_at: null` renders as running.
@@ -341,17 +341,17 @@ and reads the newest entry; a row with `finished_at: null` renders as running.
 Each user's Edit disclosure reads `GET /system/status`'s `local_login` and
 `oidc_enabled` (fetched alongside `GET /users` and `GET /libraries` when the
 Users panel loads) plus the row's own `role`/`disabled_at`/`oidc_linked` to
-decide what to grey out - or, for password sign-in, leave out entirely -
+decide what to grey out (or, for password sign-in, leave out entirely)
 rather than let the save come back refused:
 - **Reset password** is not rendered at all when `local_login` is false, and
   neither is its label or hint: the capability is off for the whole
   deployment, not a per-account exception, so the grey-not-error rule (a
   control someone could reasonably expect to use) does not apply the same
-  way it does to username/role/disabled below - there is nothing to grey,
+  way it does to username/role/disabled below: there is nothing to grey,
   only something to omit, and the field must not leave a labeled gap where
   it would have been.
 - **Username** is disabled, with a hint, when `oidc_enabled` is true and the
-  row's `oidc_linked` is false - see docs/DESIGN.md's "Username rename".
+  row's `oidc_linked` is false; see docs/DESIGN.md's "Username rename".
 - **Role** and **Disabled** are each disabled, with a hint naming which,
   on your own row (unconditionally) and on the row that is currently the
   last enabled administrator (`role === 'admin' && !disabled_at`, and no
@@ -370,7 +370,7 @@ alone for single sign-on to adopt on its first login.
 | `DELETE /imports/{id}` | cancel a queued or running job, or clear a finished one |
 
 The button is built by `addBooksButton()`, which answers `null` unless
-`store.canUpload` - that is, unless `GET /auth/me` said `can_upload: true`. The
+`store.canUpload`, that is, unless `GET /auth/me` said `can_upload: true`. The
 server folds the role into the flag before answering, so the frontend has one
 boolean to read and no rule to reimplement. Returning `null` rather than a
 disabled button is deliberate: there is nothing the user could do to make it
@@ -521,7 +521,7 @@ change, on resize and on every section load:
 | Attribute | Value |
 |---|---|
 | `flow` | `paginated`, or `scrolled` for the scrolled reading mode |
-| `max-inline-size` | `38em x font_scale`, **in px** - the renderer parses this value as a number of pixels, so a `rem` value would be read as that many pixels |
+| `max-inline-size` | `38em x font_scale`, **in px** (the renderer parses this value as a number of pixels, so a `rem` value would be read as that many pixels) |
 | `max-column-count` | `2` only when the viewport is landscape and at least 1100px wide (the renderer already forces one column in portrait), `1` otherwise and always while a cover or title page is showing |
 | `max-block-size` | the viewport height, so the text block fills it instead of stopping at the renderer's 1440px default |
 | `gap` | `7% x margin factor`, clamped to 3.5-14% |
@@ -540,7 +540,7 @@ Interaction:
   swipe page turn. A tap in the center zone toggles them and keeps them up; any
   key brings them back; `focusin` on a bar cancels the timer and `focusout`
   restarts it. Hidden means `visibility: hidden` plus `inert` and
-  `aria-hidden="true"` - never removed from the DOM.
+  `aria-hidden="true"`; never removed from the DOM.
 - Tap zones: left 18% / center 1fr / right 18%. They are real `<button>`s with
   labels, so they are keyboard reachable and screen-reader legible, but only
   the two edge gutters accept pointer events; the center passes touches
@@ -616,7 +616,7 @@ Bump `VERSION` in `sw.js` whenever anything in `web/dist/` changes.
 
 Update handoff: a new worker installs and precaches in the background but
 never calls `skipWaiting()` itself, so it never swaps out from under a page
-mid-session - an audiobook playing in the mini-player must not be interrupted
+mid-session: an audiobook playing in the mini-player must not be interrupted
 by a deploy. `main.js` watches the registration (`updatefound` /
 `statechange`, plus a `waiting` worker already present at load) and shows
 `<bs-update-toast>` once a worker is waiting with an existing controller (a
@@ -730,7 +730,7 @@ The bundle check reports seven unresolved dynamic imports inside
 `vendor/foliate-js/view.js` (`mobi.js`, `pdf.js`, `fb2.js`, `comic-book.js`,
 `tts.js`, `vendor/fflate.js`, `vendor/zip.js`). Those live in `makeBook()` and
 `initTTS()`, which this app never calls, so they are never evaluated at runtime.
-They are the reason those files are not vendored - see `vendor/VERSIONS.md`.
+They are the reason those files are not vendored; see `vendor/VERSIONS.md`.
 
 To eyeball the UI without the Go binary, serve the directory statically. Only
 `/` works that way (no API, no history fallback):
