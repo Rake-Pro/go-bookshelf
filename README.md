@@ -402,7 +402,7 @@ token in the password field.
 
 ## Development
 
-Requires Go 1.26 or newer.
+Requires Go 1.27 or newer.
 
 ```
 make build     # static binary into bin/
